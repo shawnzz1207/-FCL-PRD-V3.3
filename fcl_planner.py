@@ -159,11 +159,13 @@ def get_daily_sales_for_date(target_date, row):
 
 
 def round_preserve_sum(float_dict, target_sum):
-    int_dict = {k: int(v) for k, v in float_dict.items()}
-    remainder = {k: float_dict[k] - int_dict[k] for k, v in float_dict.items()}
+    clean_dict = {k: (0.0 if pd.isna(v) else float(v)) for k, v in float_dict.items()}
+    int_dict = {k: int(v) for k, v in clean_dict.items()}
+    remainder = {k: clean_dict[k] - int_dict[k] for k, v in clean_dict.items()}
     diff = int(target_sum - sum(int_dict.values()))
     sorted_keys = sorted(remainder.keys(), key=lambda k: remainder[k], reverse=True)
-    for i in range(diff): int_dict[sorted_keys[i]] += 1
+    for i in range(min(diff, len(sorted_keys))):
+        int_dict[sorted_keys[i]] += 1
     return int_dict
 
 
@@ -210,13 +212,12 @@ def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta,
             deadlines[r] = earliest_etd
         arrivals[r] = deadlines[r] + datetime.timedelta(days=transit_dict[r])
 
-    # 🚀 修复核心：将预计算日历天数从 1000 扩展到 3500 天，完美覆盖极端滞销品的断货推演！
     date_to_m_idx = {}
     date_to_days_in_m = {}
     for d_offset in range(3500):
         sim_d = today + datetime.timedelta(days=d_offset)
         m_diff = (sim_d.year - today.year) * 12 + sim_d.month - today.month
-        date_to_m_idx[sim_d] = min(max(m_diff, 0), 4)  # 映射为 0~4 索引
+        date_to_m_idx[sim_d] = min(max(m_diff, 0), 4)
         date_to_days_in_m[sim_d] = calendar.monthrange(sim_d.year, sim_d.month)[1]
 
     records = df.to_dict('records')
@@ -409,10 +410,27 @@ if btn_run:
     if d_diff_invalid:
         st.error("❌ D差小于最短海运时效，无法进行计算！请在左侧调整日期。")
     else:
+        working_df = edited_df.copy()
+
+        # 1. 清理所有数值列 (采用隐式换行写法，杜绝语法错误)
+        numeric_cols = (
+                ['本次总发货量'] + [f'理论_{r.replace("美", "")}%' if r in ['美西', '美东'] else f'理论_{r}%' for r in
+                                    regions] + [f'{r}_在仓' for r in regions] + ['M1预测(当月)', 'M2预测(次月)',
+                                                                                 'M3预测(第3月)', 'M4预测(第4月)',
+                                                                                 'M5预测(第5月)']
+        )
+
+        for col in numeric_cols:
+            if col in working_df.columns:
+                working_df[col] = pd.to_numeric(working_df[col], errors='coerce').fillna(0.0)
+
+        # 2. 清理所有文本列 (遇到空值转为 '-')
+        for col in ['SKU', '店铺', '组别', '运营']:
+            if col in working_df.columns:
+                working_df[col] = working_df[col].fillna('-').astype(str)
+
         if agg_checkbox:
-            working_df = aggregate_data(edited_df)
-        else:
-            working_df = edited_df.copy()
+            working_df = aggregate_data(working_df)
 
         error_skus = []
         for index, row in working_df.iterrows():
@@ -424,7 +442,7 @@ if btn_run:
 
         if len(error_skus) > 0:
             st.error("❌ **防呆拦截：数据校验失败！**")
-            st.warning("以下 SKU 的【理论分区占比】之和不等于 100%（必须严格等于100）。请在上方表格修正：\n\n" + "\n".join(
+            st.warning("以下 SKU 的【理论分区占比】之和不等于 100%（或比例未填写完全）。请在上方表格修正：\n\n" + "\n".join(
                 error_skus))
             if 'alloc_result' in st.session_state: del st.session_state['alloc_result']
         else:

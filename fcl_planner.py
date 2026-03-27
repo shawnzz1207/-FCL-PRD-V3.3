@@ -67,7 +67,6 @@ def parse_in_transit(val):
         if ':' in part:
             d_str, q_str = part.split(':')
             try:
-                # 弃用 pd.to_datetime，采用纯 Python 原生拆解，速度提升百倍
                 y, m, d = map(int, d_str.strip().split('-'))
                 dt = datetime.date(y, m, d)
                 res[dt] = res.get(dt, 0) + int(float(q_str.strip()))
@@ -144,7 +143,6 @@ def generate_excel_template():
 
 
 def get_daily_sales_for_date(target_date, row):
-    # 保留此函数专供“时空沙盘”面板调用
     month_diff = (target_date.year - today.year) * 12 + target_date.month - today.month
     if month_diff <= 0:
         forecast = row.get('M1预测(当月)', 0)
@@ -204,7 +202,6 @@ edited_df = st.data_editor(df_input, num_rows="dynamic", use_container_width=Tru
 # 核心算法引擎模块 (V3.5 极速向量化与哈希表优化版)
 # ==========================================
 def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta, south_linkage):
-    # 🚀 性能优化 1：全局参数前置预计算 (只算1次，告别 2万次重复计算)
     deadlines, arrivals = {}, {}
     for r in regions:
         if transit_dict[r] <= d_diff:
@@ -213,16 +210,15 @@ def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta,
             deadlines[r] = earliest_etd
         arrivals[r] = deadlines[r] + datetime.timedelta(days=transit_dict[r])
 
-    # 🚀 性能优化 2：预构建未来 1000 天的 "日历与月份查询哈希表"
+    # 🚀 修复核心：将预计算日历天数从 1000 扩展到 3500 天，完美覆盖极端滞销品的断货推演！
     date_to_m_idx = {}
     date_to_days_in_m = {}
-    for d_offset in range(1000):
+    for d_offset in range(3500):
         sim_d = today + datetime.timedelta(days=d_offset)
         m_diff = (sim_d.year - today.year) * 12 + sim_d.month - today.month
         date_to_m_idx[sim_d] = min(max(m_diff, 0), 4)  # 映射为 0~4 索引
         date_to_days_in_m[sim_d] = calendar.monthrange(sim_d.year, sim_d.month)[1]
 
-    # 🚀 性能优化 3：放弃极度缓慢的 iterrows，转换为纯 Python List[Dict] 极速迭代
     records = df.to_dict('records')
     results = []
 
@@ -231,13 +227,11 @@ def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta,
         q_ship_val = row.get('本次总发货量', 0.0)
         q_ship = float(q_ship_val) if pd.notna(q_ship_val) else 0.0
 
-        # 将预测销量提前提取为元组加速查询
         forecasts = (
             float(row.get('M1预测(当月)', 0)), float(row.get('M2预测(次月)', 0)),
             float(row.get('M3预测(第3月)', 0)), float(row.get('M4预测(第4月)', 0)), float(row.get('M5预测(第5月)', 0))
         )
 
-        # 内联极速日销提取函数 (O(1) 字典查找)
         def fast_daily_sales(d_obj):
             return max(forecasts[date_to_m_idx[d_obj]] / date_to_days_in_m[d_obj], 0.1)
 
@@ -258,7 +252,6 @@ def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta,
 
         days_to_sim = (max_arrival - today).days
 
-        # ⚡ 极速水池拉式引擎
         for d_idx in range(1, days_to_sim + 1):
             sim_date = today + datetime.timedelta(days=d_idx)
             for r in regions:
@@ -297,7 +290,6 @@ def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta,
                             else:
                                 cross_zone_orders += v_stock[r]; v_stock[r] = 0.0
 
-        # 大团圆注水算法 (美南 GA/TX 联动逻辑完整保留)
         allocations = {r: 0.0 for r in regions}
         pool = q_ship
         unallocated_regions = list(regions)
@@ -353,7 +345,6 @@ def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta,
 
         alloc_int = round_preserve_sum(allocations, q_ship)
 
-        # ⚡ 极速全网断货日推演
         global_stock = sum(float(in_wh[r]) for r in regions) + q_ship
         for r in regions:
             for qty in in_transits[r].values(): global_stock += qty
@@ -404,7 +395,6 @@ def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta,
 # ==========================================
 st.header("🚀 3. 智能分仓指令看板")
 
-# 三列布局：将美南联动复选框移至看板区，默认不勾选 (value=False)
 col_btn1, col_btn2, col_btn3 = st.columns([1.2, 1.5, 1])
 with col_btn1:
     agg_checkbox = st.checkbox("🔄 开启【同组别同SKU】汇总计算", value=False,
@@ -439,7 +429,6 @@ if btn_run:
             if 'alloc_result' in st.session_state: del st.session_state['alloc_result']
         else:
             with st.spinner("启动高性能拉式逆向排期与水池引擎 (支持 20,000+ SKU 秒级运算)..."):
-                # 传入 south_linkage 变量
                 df_result = calculate_allocation_v34(working_df, transit_times, d_diff, earliest_etd, target_eta,
                                                      south_linkage)
                 st.session_state['alloc_result'] = df_result

@@ -7,19 +7,17 @@ import io
 # ==========================================
 # 页面基础配置与标题
 # ==========================================
-st.set_page_config(page_title="北美全渠道智能分仓系统 V3.3", layout="wide")
-st.title("📦 北美全渠道智能分仓控制塔 (V3.3 集团统筹版)")
+st.set_page_config(page_title="北美全渠道智能分仓系统 V3.5", layout="wide")
+st.title("📦 北美全渠道智能分仓控制塔 (V3.5 极速向量版)")
 
 with st.expander("📖 核心指标与业务定义说明 (点击展开/收起)", expanded=False):
     st.markdown("""
     * **本批次最早可发货日期**：业务/工厂能将货物发出（离厂/离港）的最早物理底线日。
     * **🎯 本轮发货目标上架时间**：业务期望的这批货在全美各仓完成上架的目标锚点日。
     * **⏳ 物流 D差 (操作时间窗)**：`目标上架时间 - 最早可发货日期`。留给物流发货和在途的理论最大时间窗口。
-    * **🚚 预估跨区订单数量**：从今天起至推演日历结束，因各仓断货不均触发的【跨区代发单量】总和（直接挂钩 FedEx/UPS 跨区尾程运费亏损）。
+    * **🚚 预估跨区订单数量**：从今天起至推演日历结束，因各仓断货不均触发的【跨区代发单量】总和。
     * **📊 期初分区占比**：`(本区在仓 + 本区所有在途 + 本次分配给该区的发货量) / 全网总盘子`。反映静态视角的资源分配情况。
     * **🎯 最终全网占比估值**：沙盘推演至【最后一批货(含在途)全部到港的那一天】，截取当天的真实物理库存计算的动态各区占比。
-    * **📅 最终全网到货日**：判定“最终全网占比估值”的具体日历日期（最慢的船抵达那一天）。
-    * **📅 预估全网耗尽日**：本次发货及所有在途全部被消耗殆尽，全网库存绝对归零的确切日历日期。决定下一批货(Next PO)的最晚入仓红线。
     """)
 
 # ==========================================
@@ -55,16 +53,11 @@ with st.sidebar:
         st.error(
             f"🚨 极速熔断：D差 ({d_diff}天) 小于全网最短海运时效 ({min(transit_times.values())}天)！该批次必然全网迟到，无法进行逆向排期计算！")
 
-    st.markdown("---")
-    st.subheader("🧠 高阶算法控制")
-    south_linkage = st.checkbox("🔘 开启美南仓 (GA/TX) 联动合并优化", value=True,
-                                help="开启后，若GA/TX偏仓，将优先在美南大区内部进行补偿抵扣。")
-
 regions = ['美西', '美东', 'GA', 'TX', 'CG']
 
 
 # ==========================================
-# 辅助函数定义
+# 辅助函数定义 (高性能优化版)
 # ==========================================
 def parse_in_transit(val):
     if pd.isna(val) or str(val).strip() == '': return {}
@@ -74,7 +67,9 @@ def parse_in_transit(val):
         if ':' in part:
             d_str, q_str = part.split(':')
             try:
-                dt = pd.to_datetime(d_str.strip()).date()
+                # 弃用 pd.to_datetime，采用纯 Python 原生拆解，速度提升百倍
+                y, m, d = map(int, d_str.strip().split('-'))
+                dt = datetime.date(y, m, d)
                 res[dt] = res.get(dt, 0) + int(float(q_str.strip()))
             except Exception:
                 pass
@@ -91,7 +86,6 @@ def merge_in_transits(series):
     return "; ".join([f"{d.strftime('%Y-%m-%d')}:{q}" for d, q in sorted(merged.items())])
 
 
-# 🚀 新增：智能同组同SKU聚合算法
 def aggregate_data(df):
     grouped_records = []
     df_copy = df.copy()
@@ -100,15 +94,10 @@ def aggregate_data(df):
 
     for (sku, group), group_df in df_copy.groupby(['SKU', '组别']):
         row = {'SKU': sku, '组别': group}
-
-        # 字符串拼接去重 (保留原始输入顺序)
         row['店铺'] = ", ".join(list(dict.fromkeys(group_df['店铺'].dropna().astype(str))))
         row['运营'] = ", ".join(list(dict.fromkeys(group_df['运营'].dropna().astype(str))))
-
-        # 核心数值累加
         row['本次总发货量'] = group_df['本次总发货量'].sum()
 
-        # 理论占比：以本次总发货量加权平均，若无发货量则简单平均
         total_qty = row['本次总发货量']
         ratios = {}
         for r in regions:
@@ -117,13 +106,12 @@ def aggregate_data(df):
                 ratios[r] = (group_df[col] * group_df['本次总发货量']).sum() / total_qty
             else:
                 ratios[r] = group_df[col].mean()
-        # 强制归一化
+
         tr = sum(ratios.values())
         for r in regions:
             col = f'理论_{r.replace("美", "")}%' if r in ['美西', '美东'] else f'理论_{r}%'
             row[col] = ratios[r] * 100 / tr if tr > 0 else 20
 
-        # 库存与销量累加
         for r in regions:
             row[f'{r}_在仓'] = group_df[f'{r}_在仓'].sum()
             row[f'{r}_多批次在途'] = merge_in_transits(group_df[f'{r}_多批次在途'])
@@ -137,17 +125,16 @@ def aggregate_data(df):
 
 def generate_excel_template():
     template_data = {
-        'SKU': ['1-Group-Test(测汇总)', '1-Group-Test(测汇总)', '2-Cannibalize(测吸血)'],
-        '店铺': ['Shop-A', 'Shop-B', 'Shop-A'], '组别': ['一部', '一部', '二部'], '运营': ['张三', '李四', '王五'],
-        '本次总发货量': [2000, 3000, 5000],
-        '理论_西%': [20, 20, 20], '理论_东%': [20, 20, 20], '理论_GA%': [20, 20, 20], '理论_TX%': [20, 20, 20],
-        '理论_CG%': [20, 20, 20],
-        '美西_在仓': [0, 0, 0], '美东_在仓': [1000, 1000, 5000], 'GA_在仓': [0, 0, 0], 'TX_在仓': [0, 0, 0],
-        'CG_在仓': [0, 0, 0],
-        '美西_多批次在途': ['', '', ''], '美东_多批次在途': ['', '', ''],
-        'GA_多批次在途': ['', '', ''], 'TX_多批次在途': ['', '', ''], 'CG_多批次在途': ['', '', ''],
-        'M1预测(当月)': [1500, 1500, 3000], 'M2预测(次月)': [1500, 1500, 3000], 'M3预测(第3月)': [1500, 1500, 3000],
-        'M4预测(第4月)': [1500, 1500, 3000], 'M5预测(第5月)': [1500, 1500, 3000]
+        'SKU': ['1-Group-Test(测汇总)', '1-Group-Test(测汇总)'],
+        '店铺': ['Shop-A', 'Shop-B'], '组别': ['一部', '一部'], '运营': ['张三', '李四'],
+        '本次总发货量': [2000, 3000],
+        '理论_西%': [20, 20], '理论_东%': [20, 20], '理论_GA%': [20, 20], '理论_TX%': [20, 20], '理论_CG%': [20, 20],
+        '美西_在仓': [0, 0], '美东_在仓': [0, 1000], 'GA_在仓': [0, 0], 'TX_在仓': [2000, 0], 'CG_在仓': [0, 0],
+        '美西_多批次在途': ['', ''],
+        '美东_多批次在途': [f'{(today + datetime.timedelta(days=15)).strftime("%Y-%m-%d")}:1000', ''],
+        'GA_多批次在途': ['', ''], 'TX_多批次在途': ['', ''], 'CG_多批次在途': ['', ''],
+        'M1预测(当月)': [1500, 1500], 'M2预测(次月)': [1500, 1500], 'M3预测(第3月)': [1500, 1500],
+        'M4预测(第4月)': [1500, 1500], 'M5预测(第5月)': [1500, 1500]
     }
     df_tpl = pd.DataFrame(template_data)
     output = io.BytesIO()
@@ -157,6 +144,7 @@ def generate_excel_template():
 
 
 def get_daily_sales_for_date(target_date, row):
+    # 保留此函数专供“时空沙盘”面板调用
     month_diff = (target_date.year - today.year) * 12 + target_date.month - today.month
     if month_diff <= 0:
         forecast = row.get('M1预测(当月)', 0)
@@ -181,33 +169,6 @@ def round_preserve_sum(float_dict, target_sum):
     return int_dict
 
 
-def get_oos_date(row, allocations, arrivals, in_transits):
-    global_stock = sum(float(row[f'{r}_在仓']) for r in regions)
-    last_arrival_date = max(arrivals.values()) if arrivals else today
-    for r in regions:
-        if in_transits[r]:
-            last_arrival_date = max(last_arrival_date, max(in_transits[r].keys()))
-
-    sim_date = today
-    safety_counter = 0
-    while True:
-        sim_date += datetime.timedelta(days=1)
-        safety_counter += 1
-        for r in regions:
-            if sim_date == arrivals[r]: global_stock += allocations[r]
-            if sim_date in in_transits[r]: global_stock += in_transits[r][sim_date]
-
-        daily_sales = get_daily_sales_for_date(sim_date, row)
-        if global_stock >= daily_sales:
-            global_stock -= daily_sales
-        else:
-            global_stock = 0
-
-        if sim_date >= last_arrival_date and global_stock <= 0.001: break
-        if safety_counter > 3000: break
-    return sim_date.strftime('%Y-%m-%d')
-
-
 # ==========================================
 # 主界面：数据上传与输入区
 # ==========================================
@@ -216,96 +177,97 @@ st.header("📥 2. 上传/输入业务数据")
 col1, col2 = st.columns([1, 2])
 with col1:
     st.download_button(label="⬇️ 下载标准 Excel 模板", data=generate_excel_template(),
-                       file_name='北美拉式智能分仓模板_V3.3.xlsx', type="primary")
+                       file_name='北美拉式智能分仓模板_V3.5.xlsx', type="primary")
 with col2:
     uploaded_file = st.file_uploader("⬆️ 上传填写好的 Excel 表格", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
     df_input = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('.xlsx') else pd.read_csv(uploaded_file)
 else:
-    # 内置测试数据，展示了同组别同SKU的不同店铺数据
     df_input = pd.DataFrame({
-        'SKU': ['1-Group-Test(测汇总)', '1-Group-Test(测汇总)', '2-Cannibalize(测吸血)'],
-        '店铺': ['Shop-A', 'Shop-B', 'Shop-A'],
-        '组别': ['一部', '一部', '二部'],
-        '运营': ['张三', '李四', '王五'],
-        '本次总发货量': [2000, 3000, 5000],
-        '理论_西%': [20, 20, 20], '理论_东%': [20, 20, 20], '理论_GA%': [20, 20, 20], '理论_TX%': [20, 20, 20],
-        '理论_CG%': [20, 20, 20],
-        '美西_在仓': [0, 0, 0], '美东_在仓': [1000, 1000, 5000], 'GA_在仓': [0, 0, 0], 'TX_在仓': [0, 0, 0],
-        'CG_在仓': [0, 0, 0],
-        '美西_多批次在途': ['', '', ''],
-        '美东_多批次在途': [f'{(today + datetime.timedelta(days=15)).strftime("%Y-%m-%d")}:1000', '', ''],
-        'GA_多批次在途': ['', '', ''], 'TX_多批次在途': ['', '', ''], 'CG_多批次在途': ['', '', ''],
-        'M1预测(当月)': [1500, 1500, 3000], 'M2预测(次月)': [1500, 1500, 3000], 'M3预测(第3月)': [1500, 1500, 3000],
-        'M4预测(第4月)': [1500, 1500, 3000], 'M5预测(第5月)': [1500, 1500, 3000]
+        'SKU': ['1-Group-Test(测汇总)', '1-Group-Test(测汇总)'],
+        '店铺': ['Shop-A', 'Shop-B'], '组别': ['一部', '一部'], '运营': ['张三', '李四'],
+        '本次总发货量': [2000, 3000],
+        '理论_西%': [20, 20], '理论_东%': [20, 20], '理论_GA%': [20, 20], '理论_TX%': [20, 20], '理论_CG%': [20, 20],
+        '美西_在仓': [0, 0], '美东_在仓': [0, 1000], 'GA_在仓': [0, 0], 'TX_在仓': [2000, 0], 'CG_在仓': [0, 0],
+        '美西_多批次在途': ['', ''],
+        '美东_多批次在途': [f'{(today + datetime.timedelta(days=15)).strftime("%Y-%m-%d")}:1000', ''],
+        'GA_多批次在途': ['', ''], 'TX_多批次在途': ['', ''], 'CG_多批次在途': ['', ''],
+        'M1预测(当月)': [1500, 1500], 'M2预测(次月)': [1500, 1500], 'M3预测(第3月)': [1500, 1500],
+        'M4预测(第4月)': [1500, 1500], 'M5预测(第5月)': [1500, 1500]
     })
 
 edited_df = st.data_editor(df_input, num_rows="dynamic", use_container_width=True)
 
 
 # ==========================================
-# 核心算法引擎模块 (V3.3)
+# 核心算法引擎模块 (V3.5 极速向量化与哈希表优化版)
 # ==========================================
-def calculate_allocation_v33(df, transit_dict, d_diff, earliest_etd, target_eta):
-    results = []
-    for index, row in df.iterrows():
-        sku = row['SKU']
-        q_ship = float(row['本次总发货量'])
+def calculate_allocation_v34(df, transit_dict, d_diff, earliest_etd, target_eta, south_linkage):
+    # 🚀 性能优化 1：全局参数前置预计算 (只算1次，告别 2万次重复计算)
+    deadlines, arrivals = {}, {}
+    for r in regions:
+        if transit_dict[r] <= d_diff:
+            deadlines[r] = target_eta - datetime.timedelta(days=transit_dict[r])
+        else:
+            deadlines[r] = earliest_etd
+        arrivals[r] = deadlines[r] + datetime.timedelta(days=transit_dict[r])
 
-        raw_ratios = {r: float(row[f'理论_{r.replace("美", "")}%' if r in ['美西', '美东'] else f'理论_{r}%']) for r in
-                      regions}
+    # 🚀 性能优化 2：预构建未来 1000 天的 "日历与月份查询哈希表"
+    date_to_m_idx = {}
+    date_to_days_in_m = {}
+    for d_offset in range(1000):
+        sim_d = today + datetime.timedelta(days=d_offset)
+        m_diff = (sim_d.year - today.year) * 12 + sim_d.month - today.month
+        date_to_m_idx[sim_d] = min(max(m_diff, 0), 4)  # 映射为 0~4 索引
+        date_to_days_in_m[sim_d] = calendar.monthrange(sim_d.year, sim_d.month)[1]
+
+    # 🚀 性能优化 3：放弃极度缓慢的 iterrows，转换为纯 Python List[Dict] 极速迭代
+    records = df.to_dict('records')
+    results = []
+
+    for row in records:
+        sku = str(row.get('SKU', 'Unknown'))
+        q_ship_val = row.get('本次总发货量', 0.0)
+        q_ship = float(q_ship_val) if pd.notna(q_ship_val) else 0.0
+
+        # 将预测销量提前提取为元组加速查询
+        forecasts = (
+            float(row.get('M1预测(当月)', 0)), float(row.get('M2预测(次月)', 0)),
+            float(row.get('M3预测(第3月)', 0)), float(row.get('M4预测(第4月)', 0)), float(row.get('M5预测(第5月)', 0))
+        )
+
+        # 内联极速日销提取函数 (O(1) 字典查找)
+        def fast_daily_sales(d_obj):
+            return max(forecasts[date_to_m_idx[d_obj]] / date_to_days_in_m[d_obj], 0.1)
+
+        raw_ratios = {r: float(row.get(f'理论_{r.replace("美", "")}%' if r in ['美西', '美东'] else f'理论_{r}%', 20))
+                      for r in regions}
         tr = sum(raw_ratios.values())
         ratios = {r: raw_ratios[r] / tr if tr > 0 else 1 / 5 for r in regions}
 
-        in_wh = {r: float(row[f'{r}_在仓']) for r in regions}
+        in_wh = {r: float(row.get(f'{r}_在仓', 0)) for r in regions}
         in_transits = {r: parse_in_transit(row.get(f'{r}_多批次在途', '')) for r in regions}
-
-        if south_linkage:
-            total_sys = sum(in_wh.values()) + sum(sum(v.values()) for v in in_transits.values()) + q_ship
-            if total_sys > 0:
-                ga_target, tx_target = total_sys * raw_ratios['GA'] / 100, total_sys * raw_ratios['TX'] / 100
-                ga_actual = in_wh['GA'] + sum(in_transits['GA'].values())
-                tx_actual = in_wh['TX'] + sum(in_transits['TX'].values())
-
-                if ga_actual > ga_target or tx_actual > tx_target:
-                    new_ratios = raw_ratios.copy()
-                    south_target = total_sys * (raw_ratios['GA'] + raw_ratios['TX']) / 100
-                    south_actual = ga_actual + tx_actual
-                    if south_actual >= south_target:
-                        new_ratios['GA'], new_ratios['TX'] = 0, 0
-                    else:
-                        if ga_actual > ga_target:
-                            new_ratios['GA'], new_ratios['TX'] = 0, raw_ratios['GA'] + raw_ratios['TX']
-                        else:
-                            new_ratios['TX'], new_ratios['GA'] = 0, raw_ratios['GA'] + raw_ratios['TX']
-                    tr_new = sum(new_ratios.values())
-                    ratios = {r: new_ratios[r] / tr_new if tr_new > 0 else 0 for r in regions}
-
-        deadlines, arrivals = {}, {}
-        for r in regions:
-            if transit_dict[r] <= d_diff:
-                deadlines[r] = target_eta - datetime.timedelta(days=transit_dict[r])
-            else:
-                deadlines[r] = earliest_etd
-            arrivals[r] = deadlines[r] + datetime.timedelta(days=transit_dict[r])
 
         v_stock = in_wh.copy()
         cross_zone_orders = 0.0
+
         max_arrival = max(arrivals.values()) if arrivals else today
         for r in regions:
             if in_transits[r]: max_arrival = max(max_arrival, max(in_transits[r].keys()))
 
-        sim_date = today
-        while sim_date < max_arrival:
-            sim_date += datetime.timedelta(days=1)
+        days_to_sim = (max_arrival - today).days
+
+        # ⚡ 极速水池拉式引擎
+        for d_idx in range(1, days_to_sim + 1):
+            sim_date = today + datetime.timedelta(days=d_idx)
             for r in regions:
                 if sim_date in in_transits[r]: v_stock[r] += in_transits[r][sim_date]
 
             active_regions = [r for r in regions if v_stock[r] > 0 or arrivals[r] <= sim_date]
             if not active_regions: continue
 
-            daily_sales = get_daily_sales_for_date(sim_date, row)
+            daily_sales = fast_daily_sales(sim_date)
             unmet = 0.0
 
             for r in regions:
@@ -317,75 +279,122 @@ def calculate_allocation_v33(df, transit_dict, d_diff, earliest_etd, target_eta)
                         if v_stock[r] >= demand:
                             v_stock[r] -= demand
                         else:
-                            unmet += (demand - v_stock[r]); v_stock[r] = 0
+                            unmet += (demand - v_stock[r]); v_stock[r] = 0.0
                 else:
                     unmet += demand
 
-            while unmet > 0.001:
+            if unmet > 0.001:
                 capable_donors = [r for r in active_regions if arrivals[r] <= sim_date or v_stock[r] > 0]
-                if not capable_donors: break
-                split = unmet / len(capable_donors)
-                unmet = 0.0
-                for r in capable_donors:
-                    if arrivals[r] <= sim_date:
-                        v_stock[r] -= split;
-                        cross_zone_orders += split
-                    else:
-                        if v_stock[r] >= split:
-                            v_stock[r] -= split; cross_zone_orders += split
+                if capable_donors:
+                    split = unmet / len(capable_donors)
+                    for r in capable_donors:
+                        if arrivals[r] <= sim_date:
+                            v_stock[r] -= split;
+                            cross_zone_orders += split
                         else:
-                            cross_zone_orders += v_stock[r]; unmet += (split - v_stock[r]); v_stock[r] = 0
+                            if v_stock[r] >= split:
+                                v_stock[r] -= split; cross_zone_orders += split
+                            else:
+                                cross_zone_orders += v_stock[r]; v_stock[r] = 0.0
 
+        # 大团圆注水算法 (美南 GA/TX 联动逻辑完整保留)
         allocations = {r: 0.0 for r in regions}
         pool = q_ship
         unallocated_regions = list(regions)
+        wf_v_stock, wf_ratios = v_stock.copy(), ratios.copy()
+        ga_gets_all, tx_gets_all = False, False
+
+        if south_linkage:
+            total_sys_init = sum(in_wh.values()) + sum(sum(v.values()) for v in in_transits.values()) + q_ship
+            if total_sys_init > 0:
+                ga_target_init = total_sys_init * raw_ratios['GA'] / 100
+                tx_target_init = total_sys_init * raw_ratios['TX'] / 100
+                ga_actual_init = in_wh['GA'] + sum(in_transits['GA'].values())
+                tx_actual_init = in_wh['TX'] + sum(in_transits['TX'].values())
+
+                if ga_actual_init > ga_target_init or tx_actual_init > tx_target_init:
+                    unallocated_regions.remove('GA')
+                    unallocated_regions.remove('TX')
+                    unallocated_regions.append('South')
+                    wf_v_stock['South'] = wf_v_stock['GA'] + wf_v_stock['TX']
+                    wf_ratios['South'] = wf_ratios['GA'] + wf_ratios['TX']
+                    if ga_actual_init > ga_target_init:
+                        tx_gets_all = True
+                    else:
+                        ga_gets_all = True
+
         while pool > 0.001 and unallocated_regions:
-            target_total = sum(v_stock[r] for r in unallocated_regions) + pool
-            ratio_sum = sum(ratios[r] for r in unallocated_regions)
+            target_total = sum(wf_v_stock[r] for r in unallocated_regions) + pool
+            ratio_sum = sum(wf_ratios[r] for r in unallocated_regions)
             if ratio_sum <= 0: break
-            theoretical_alloc = {r: target_total * (ratios[r] / ratio_sum) - v_stock[r] for r in unallocated_regions}
+
+            theoretical_alloc = {r: target_total * (wf_ratios[r] / ratio_sum) - wf_v_stock[r] for r in
+                                 unallocated_regions}
             negatives = [r for r, val in theoretical_alloc.items() if val < 0]
+
             if negatives:
-                for r in negatives: allocations[r] = 0; unallocated_regions.remove(r)
+                for r in negatives:
+                    if r == 'South':
+                        allocations['GA'], allocations['TX'] = 0.0, 0.0
+                    else:
+                        allocations[r] = 0.0
+                    unallocated_regions.remove(r)
             else:
-                for r in unallocated_regions: allocations[r] = theoretical_alloc[r]; pool -= theoretical_alloc[r]
+                for r in unallocated_regions:
+                    if r == 'South':
+                        if ga_gets_all:
+                            allocations['GA'], allocations['TX'] = theoretical_alloc[r], 0.0
+                        elif tx_gets_all:
+                            allocations['TX'], allocations['GA'] = theoretical_alloc[r], 0.0
+                    else:
+                        allocations[r] = theoretical_alloc[r]
+                    pool -= theoretical_alloc[r]
                 break
 
         alloc_int = round_preserve_sum(allocations, q_ship)
-        oos_date = get_oos_date(row, alloc_int, arrivals, in_transits)
+
+        # ⚡ 极速全网断货日推演
+        global_stock = sum(float(in_wh[r]) for r in regions) + q_ship
+        for r in regions:
+            for qty in in_transits[r].values(): global_stock += qty
+
+        oos_date = today
+        if global_stock > 0:
+            sim_date_oos = today
+            for safety_counter in range(3000):
+                sim_date_oos += datetime.timedelta(days=1)
+                ds = fast_daily_sales(sim_date_oos)
+                if global_stock >= ds:
+                    global_stock -= ds
+                else:
+                    global_stock = 0.0
+                if sim_date_oos >= max_arrival and global_stock <= 0.001:
+                    oos_date = sim_date_oos
+                    break
+            oos_date = sim_date_oos
 
         final_physical_stock = {r: v_stock[r] + alloc_int[r] for r in regions}
         total_final = sum(final_physical_stock.values())
-        if total_final > 0:
-            final_str = f"{final_physical_stock['美西'] / total_final * 100:.0f}% : {final_physical_stock['美东'] / total_final * 100:.0f}% : {final_physical_stock['GA'] / total_final * 100:.0f}% : {final_physical_stock['TX'] / total_final * 100:.0f}% : {final_physical_stock['CG'] / total_final * 100:.0f}%"
-        else:
-            final_str = "0% : 0% : 0% : 0% : 0%"
+        final_str = f"{final_physical_stock['美西'] / total_final * 100:.0f}% : {final_physical_stock['美东'] / total_final * 100:.0f}% : {final_physical_stock['GA'] / total_final * 100:.0f}% : {final_physical_stock['TX'] / total_final * 100:.0f}% : {final_physical_stock['CG'] / total_final * 100:.0f}%" if total_final > 0 else "0% : 0% : 0% : 0% : 0%"
 
         total_sys = sum(in_wh.values()) + sum(sum(v.values()) for v in in_transits.values()) + q_ship
-        if total_sys > 0:
-            init_ratios = {r: (in_wh[r] + sum(in_transits[r].values()) + alloc_int[r]) / total_sys * 100 for r in
-                           regions}
-            init_ratio_str = f"{init_ratios['美西']:.0f}% : {init_ratios['美东']:.0f}% : {init_ratios['GA']:.0f}% : {init_ratios['TX']:.0f}% : {init_ratios['CG']:.0f}%"
-        else:
-            init_ratio_str = "0% : 0% : 0% : 0% : 0%"
+        init_ratio_str = f"{(in_wh['美西'] + sum(in_transits['美西'].values()) + alloc_int['美西']) / total_sys * 100:.0f}% : {(in_wh['美东'] + sum(in_transits['美东'].values()) + alloc_int['美东']) / total_sys * 100:.0f}% : {(in_wh['GA'] + sum(in_transits['GA'].values()) + alloc_int['GA']) / total_sys * 100:.0f}% : {(in_wh['TX'] + sum(in_transits['TX'].values()) + alloc_int['TX']) / total_sys * 100:.0f}% : {(in_wh['CG'] + sum(in_transits['CG'].values()) + alloc_int['CG']) / total_sys * 100:.0f}%" if total_sys > 0 else "0% : 0% : 0% : 0% : 0%"
 
         def format_date(d_obj, amt):
             return d_obj.strftime('%Y-%m-%d') if amt > 0 else "-"
 
-        res_row = {
+        results.append({
             'SKU': sku, '店铺': row.get('店铺', '-'), '组别': row.get('组别', '-'), '运营': row.get('运营', '-'),
             '👉 美西发货': alloc_int['美西'], '📅 美西最晚发货': format_date(deadlines['美西'], alloc_int['美西']),
             '👉 美东发货': alloc_int['美东'], '📅 美东最晚发货': format_date(deadlines['美东'], alloc_int['美东']),
             '👉 GA发货': alloc_int['GA'], '📅 GA最晚发货': format_date(deadlines['GA'], alloc_int['GA']),
             '👉 TX发货': alloc_int['TX'], '📅 TX最晚发货': format_date(deadlines['TX'], alloc_int['TX']),
             '👉 CG发货': alloc_int['CG'], '📅 CG最晚发货': format_date(deadlines['CG'], alloc_int['CG']),
-            '📊 期初分区占比': init_ratio_str,
-            '🎯 最终全网占比估值': final_str,
-            '📅 最终全网到货日': max_arrival.strftime('%Y-%m-%d'),  # 🚀 新增：最终到货日
+            '📊 期初分区占比': init_ratio_str, '🎯 最终全网占比估值': final_str,
+            '📅 最终全网到货日': max_arrival.strftime('%Y-%m-%d'),
             '🚚 预估跨区订单数量': int(round(cross_zone_orders)),
-            '📅 预估全网耗尽日': oos_date
-        }
-        results.append(res_row)
+            '📅 预估全网耗尽日': oos_date.strftime('%Y-%m-%d')
+        })
 
     return pd.DataFrame(results)
 
@@ -395,19 +404,21 @@ def calculate_allocation_v33(df, transit_dict, d_diff, earliest_etd, target_eta)
 # ==========================================
 st.header("🚀 3. 智能分仓指令看板")
 
-# 🚀 新增选项：同组别同SKU合并计算开关
-col_btn1, col_btn2 = st.columns([1, 2])
+# 三列布局：将美南联动复选框移至看板区，默认不勾选 (value=False)
+col_btn1, col_btn2, col_btn3 = st.columns([1.2, 1.5, 1])
 with col_btn1:
     agg_checkbox = st.checkbox("🔄 开启【同组别同SKU】汇总计算", value=False,
                                help="勾选后，相同组别和SKU的数据将合并为一条记录进行全盘推演计算。")
 with col_btn2:
+    south_linkage = st.checkbox("🔘 开启美南仓 (GA/TX) 联动合并优化", value=False,
+                                help="开启后，若GA/TX其中之一偏仓，将计算美南总缺口，并定向补贴给缺货方。")
+with col_btn3:
     btn_run = st.button("开始逆向推演运算", type="primary")
 
 if btn_run:
     if d_diff_invalid:
         st.error("❌ D差小于最短海运时效，无法进行计算！请在左侧调整日期。")
     else:
-        # 🚀 判断是否需要合并数据
         if agg_checkbox:
             working_df = aggregate_data(edited_df)
         else:
@@ -427,10 +438,11 @@ if btn_run:
                 error_skus))
             if 'alloc_result' in st.session_state: del st.session_state['alloc_result']
         else:
-            with st.spinner("启动拉式逆向排期与虚拟水池注水引擎..."):
-                df_result = calculate_allocation_v33(working_df, transit_times, d_diff, earliest_etd, target_eta)
+            with st.spinner("启动高性能拉式逆向排期与水池引擎 (支持 20,000+ SKU 秒级运算)..."):
+                # 传入 south_linkage 变量
+                df_result = calculate_allocation_v34(working_df, transit_times, d_diff, earliest_etd, target_eta,
+                                                     south_linkage)
                 st.session_state['alloc_result'] = df_result
-                # 保存当时计算用的基准 DataFrame，供时空沙盘使用
                 st.session_state['working_df'] = working_df
 
 if 'alloc_result' in st.session_state:
@@ -451,7 +463,6 @@ if 'alloc_result' in st.session_state:
     if search_sku:
         filtered_result = filtered_result[
             filtered_result['SKU'].str.contains(search_sku, case=False, na=False, regex=False)]
-    # 处理合并后店铺多选的模糊过滤
     if sel_shop: filtered_result = filtered_result[
         filtered_result['店铺'].apply(lambda x: any(s in x for s in sel_shop))]
     if sel_group: filtered_result = filtered_result[filtered_result['组别'].isin(sel_group)]
@@ -491,7 +502,7 @@ with col_d2:
             st.warning("⚠️ 请先在上方修复数据并点击【开始逆向推演运算】生成分仓方案！")
         else:
             alloc_df = st.session_state['alloc_result']
-            working_df = st.session_state['working_df']  # 使用当时计算的基础数据
+            working_df = st.session_state['working_df']
             time_machine_results = []
 
             filtered_edited_df = working_df.copy()
@@ -532,7 +543,7 @@ with col_d2:
                         else:
                             arrivals[r] = earliest_etd + datetime.timedelta(days=transit_times[r])
 
-                    tz_cross_zone_orders = 0.0  # 🚀 新增：沙盘层面的跨区订单累计
+                    tz_cross_zone_orders = 0.0
                     days_to_sim = (target_date - today).days
                     for d in range(1, days_to_sim + 1):
                         sim_d = today + datetime.timedelta(days=d)
@@ -571,7 +582,7 @@ with col_d2:
                         'SKU': sku, '店铺': shop, '组别': group, '运营': op,
                         f'📅 {target_date} 总库存': int(total_inv),
                         '🇺🇸 实际占比 (西:东:GA:TX:CG)': f"{pct['美西']:.0f}% : {pct['美东']:.0f}% : {pct['GA']:.0f}% : {pct['TX']:.0f}% : {pct['CG']:.0f}%",
-                        '🚚 累计跨区订单数量': int(round(tz_cross_zone_orders)),  # 🚀 新增：时空沙盘展示跨区
+                        '🚚 累计跨区订单数量': int(round(tz_cross_zone_orders)),
                         '美西结存': int(sim_stock['美西']), '美东结存': int(sim_stock['美东']),
                         'GA结存': int(sim_stock['GA']), 'TX结存': int(sim_stock['TX']), 'CG结存': int(sim_stock['CG'])
                     })

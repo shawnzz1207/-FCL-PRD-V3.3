@@ -25,15 +25,24 @@ def ratio_col_name(r):
 
 
 def parse_in_transit(val):
-    """解析 '2026-04-25:2000; 2026-05-10:500' → {date: qty}"""
+    """解析 '2026-04-25:2000; 2026-05-10:500' → {date: qty}
+
+    兼容多种分隔符：
+    - 中英文分号：; ；
+    - 中英文逗号：, ，
+    - 中文冒号：：
+    """
     if pd.isna(val) or str(val).strip() == '':
         return {}
     res = {}
-    clean = str(val).replace('；', ';').replace('：', ':')
+    clean = str(val).replace('；', ';').replace('：', ':').replace('，', ',')
+    # 把所有分隔符统一替换成 ;
+    clean = clean.replace(',', ';')
     for part in clean.split(';'):
+        part = part.strip()
         if ':' in part:
-            d_str, q_str = part.split(':')
             try:
+                d_str, q_str = part.split(':', 1)  # maxsplit=1 防多个冒号
                 y, m, d = map(int, d_str.strip().split('-'))
                 dt = datetime.date(y, m, d)
                 res[dt] = res.get(dt, 0) + int(float(q_str.strip()))
@@ -60,8 +69,7 @@ def merge_in_transits(series):
 
 
 def aggregate_data(df):
-    """
-    同 SKU + 组别 的多行数据合并为一行
+    """同 SKU + 组别 的多行数据合并为一行
     （用于"同组别同SKU 汇总计算"开关）
     """
     grouped_records = []
@@ -101,8 +109,7 @@ def aggregate_data(df):
 
 
 def round_preserve_sum(float_dict, target_sum):
-    """
-    四舍五入各区分配量，同时保证和 = target_sum
+    """四舍五入各区分配量，同时保证和 = target_sum
     用最大余数法补 1
     """
     clean = {k: (0.0 if pd.isna(v) else float(v)) for k, v in float_dict.items()}
@@ -124,8 +131,7 @@ def row_to_key(row):
 # 推演前置：计算到港日与日销函数
 # ============================================================
 def compute_arrivals(transit_dict, earliest_etd, target_eta):
-    """
-    计算本次发货各区到港日
+    """计算本次发货各区到港日
     不迟到区: arrival = target_eta
     迟到区:   arrival = earliest_etd + transit_days
     """
@@ -188,8 +194,7 @@ def waterpool_allocation(row, transit_dict, earliest_etd, target_eta,
     2. 用 v_stock 做水池分配：让 (v_stock[r] + alloc[r]) / sum_total 接近理论占比
     3. 出现负数分配时剔除该区（已富余），重新分配
 
-    注意: 本函数只负责决定"各区发多少"，不负责计算"最终占比/跨区/耗尽日"
-          后者由 physical_simulation() 完成
+    注意: 本函数只负责决定"各区发多少"，不负责计算"最终占比/跨区/耗尽日"后者由 physical_simulation() 完成
     """
     today = datetime.date.today()  # 调用方用自己的 today；这里临时用
     # 注意：真实使用时 today 会由调用方通过上下文传入，此处占位
@@ -331,12 +336,11 @@ def waterpool_allocation_v2(row, transit_dict, earliest_etd, target_eta,
 
 
 # ============================================================
-# 🆕 物理真实推演（V3.6.5 新引擎·核心）
+# 物理真实推演（V3.6.5 新引擎·核心）
 # ============================================================
 def physical_simulation(row, transit_dict, earliest_etd, target_eta,
                         today, alloc_int, sales_cutoff, end_date=None):
-    """
-    物理真实推演（唯一口径，替换 V3.5 所有输出指标计算）
+    """物理真实推演（唯一口径，替换 V3.5 所有输出指标计算）
 
     入参:
         row: 一行数据
@@ -491,8 +495,7 @@ def physical_simulation(row, transit_dict, earliest_etd, target_eta,
 def compute_row_metrics(row, transit_dict, earliest_etd, target_eta,
                         today, sales_cutoff, south_linkage=False,
                         q_ship_override=None):
-    """
-    一站式计算一行的所有输出指标（主看板展示用）
+    """一站式计算一行的所有输出指标（主看板展示用）
 
     Returns dict:
         alloc: {区: 发货量} 整数
@@ -510,7 +513,7 @@ def compute_row_metrics(row, transit_dict, earliest_etd, target_eta,
     deadlines = compute_deadlines(transit_dict, earliest_etd, target_eta)
     arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
 
-    # 若被 override，临时改 row 的 '本次总发货量' 供推演用（不污染原 row）
+    # 若被 override，临时改 row 的 '本次总发货量'供推演用（不污染原 row）
     row_for_sim = row.copy() if isinstance(row, dict) else row.to_dict()
     if q_ship_override is not None:
         row_for_sim['本次总发货量'] = q_ship_override
@@ -533,8 +536,7 @@ def compute_row_metrics(row, transit_dict, earliest_etd, target_eta,
 
 def compute_sandbox_metrics(row, alloc_int, transit_dict, earliest_etd, target_eta,
                             today, sales_cutoff, query_date):
-    """
-    沙盘查询：返回 query_date 那天的库存分布和累计跨区
+    """沙盘查询：返回 query_date 那天的库存分布和累计跨区
     使用 compute_row_metrics 计算出的 alloc（已分配好的发货量）
     """
     row_for_sim = row.copy() if isinstance(row, dict) else row.to_dict()
@@ -566,8 +568,7 @@ def compute_sandbox_metrics(row, alloc_int, transit_dict, earliest_etd, target_e
 # ============================================================
 def compute_row_status(row, transit_dict, earliest_etd, target_eta,
                        today, sales_cutoff, south_linkage=False):
-    """
-    计算一行的核心状态三元组：
+    """计算一行的核心状态三元组：
     - SD: 实际可售天数（从今天到销售截止日，全网物理库存 > 0 的天数）
     - RQ: 剩余冗余量（销售截止日当天的全网物理库存）
     - CZ: 销售截止日前累计跨区订单数
@@ -605,8 +606,7 @@ def compute_row_status(row, transit_dict, earliest_etd, target_eta,
 
 def compute_sd(row, alloc, transit_dict, earliest_etd, target_eta,
                today, sales_cutoff):
-    """
-    精确计算"实际可售天数" SD
+    """精确计算"实际可售天数" SD
     定义：从今天到销售截止日期间，全网物理库存 > 0 的天数
     """
     arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
@@ -669,8 +669,7 @@ def compute_sd(row, alloc, transit_dict, earliest_etd, target_eta,
 # 调拨执行函数（带物理上限保护）
 # ============================================================
 def apply_transfer(df, out_idx, in_idx, src_type, region, source_date, qty):
-    """
-    执行一次调拨（原地修改 df）
+    """执行一次调拨（原地修改 df）
     带物理上限保护：qty 自动截断为实际可调量
     返回实际调拨量（可能 < qty）
     """
@@ -754,8 +753,7 @@ def get_stock_sources(row_dict):
 # ============================================================
 def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
                                today, sales_cutoff, south_linkage=False):
-    """
-    阶段1 全局贪心冗余调拨
+    """阶段1 全局贪心冗余调拨
     返回: (transfer_records, df_after)
     """
     df = df.copy().reset_index(drop=True)
@@ -880,8 +878,7 @@ def binary_search_max_transfer(df, g_idx, r_idx, src_type, src_region, src_date,
                                transit_dict, earliest_etd, target_eta,
                                today, sales_cutoff, south_linkage,
                                sales_window, g_status, r_status):
-    """
-    二分搜索：找出"3 重锁"下最大的可调拨量
+    """二分搜索：找出"3 重锁"下最大的可调拨量
     锁1: qty <= src_max （物理上限）  → 已在 apply_transfer 保护
     锁2: 调出方调出后 SD 不下降（不变得"更缺货"）
     锁3: 调入方调入后 RQ 不增加（在缺货等待期内消耗的货才合法）
@@ -941,8 +938,7 @@ def binary_search_max_transfer(df, g_idx, r_idx, src_type, src_region, src_date,
 # ============================================================
 def stage2_independent_reduction(df, transit_dict, earliest_etd, target_eta,
                                  today, sales_cutoff, south_linkage=False):
-    """
-    阶段2 独立减量
+    """阶段2 独立减量
     公式: new_q_ship = q_ship - min(RQ, q_ship)
     """
     df = df.copy().reset_index(drop=True)
@@ -989,8 +985,7 @@ def stage2_independent_reduction(df, transit_dict, earliest_etd, target_eta,
 # ============================================================
 def run_stage_1_and_2(df_baseline, transit_dict, earliest_etd, target_eta,
                       today, sales_cutoff, south_linkage=False):
-    """
-    执行阶段1（冗余调拨）+ 阶段2（独立减量）
+    """执行阶段1（冗余调拨）+ 阶段2（独立减量）
     返回:
         transfer_records_s1: 阶段1 冗余调拨记录
         reduce_records_s2: 阶段2 减量记录
@@ -1029,8 +1024,7 @@ def run_stage_1_and_2(df_baseline, transit_dict, earliest_etd, target_eta,
 # 候选预筛：哪些 (行A, 行B, 区域 X) 组合值得评估？
 # ============================================================
 def get_row_region_donor_capacity(row_dict, region):
-    """
-    返回该行在指定区域的可调出物理库存量
+    """返回该行在指定区域的可调出物理库存量
     （在仓 + 在途，不含本次发货量，因为本次发货量是分区前的）
     """
     capacity = 0.0
@@ -1041,8 +1035,7 @@ def get_row_region_donor_capacity(row_dict, region):
 
 
 def filter_partition_candidates(df, sku_indices, status_dict):
-    """
-    候选预筛（选项 C 简单预筛）：
+    """候选预筛（选项 C 简单预筛）：
     - 预筛1：行A 在区 X 有可调出物理库存 > 0
     - 预筛2：行B 当前 CZ > 0
 
@@ -1072,8 +1065,7 @@ def evaluate_single_transfer(df, out_idx, in_idx, src_type, src_region, src_date
                              transit_dict, earliest_etd, target_eta,
                              today, sales_cutoff, south_linkage,
                              baseline_status):
-    """
-    评估单向调拨的合法性 + ΔCZ 改善
+    """评估单向调拨的合法性 + ΔCZ 改善
     锁1: qty <= 物理上限（apply 自带保护）
     锁2: 调出方 SD 不下降
     锁3: 调入方 SD 不下降
@@ -1128,8 +1120,7 @@ def evaluate_swap_transfer(df, a_idx, b_idx,
                            transit_dict, earliest_etd, target_eta,
                            today, sales_cutoff, south_linkage,
                            baseline_status):
-    """
-    评估双向对调原子动作: A 调 X → B + B 调 Y → A，两步必须同时合法
+    """评估双向对调原子动作: A 调 X → B + B 调 Y → A，两步必须同时合法
     锁同 evaluate_single_transfer，但对 a_idx 和 b_idx 各自检查
 
     返回 (ΔCZ_total, is_valid)
@@ -1183,8 +1174,7 @@ def binary_search_single_transfer(df, out_idx, in_idx, src_type, src_region, src
                                   transit_dict, earliest_etd, target_eta,
                                   today, sales_cutoff, south_linkage,
                                   baseline_status):
-    """
-    多档位扫描单向调拨最大有效量
+    """多档位扫描单向调拨最大有效量
     （ΔCZ 关于调拨量可能非单调，避免二分错失）
     """
     if src_max < 1:
@@ -1231,8 +1221,7 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
                                 transit_dict, earliest_etd, target_eta,
                                 today, sales_cutoff, south_linkage,
                                 baseline_status):
-    """
-    多档位扫描双向对调最大有效量
+    """多档位扫描双向对调最大有效量
 
     重要：ΔCZ 关于调拨量呈 V 字曲线（先降后升），不能用二分。
     这里用 12 档线性扫描，找最优点。
@@ -1286,8 +1275,7 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
 # ============================================================
 def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                               today, sales_cutoff, south_linkage=False):
-    """
-    阶段3 全局贪心分区调拨
+    """阶段3 全局贪心分区调拨
     返回: (transfer_records, df_after)
     """
     df = df.copy().reset_index(drop=True)
@@ -1490,8 +1478,7 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
 # ============================================================
 def stage4_dead_redundancy_report(df, transit_dict, earliest_etd, target_eta,
                                   today, sales_cutoff, south_linkage=False):
-    """
-    阶段4 死冗余检测：经过阶段1+2+3 后仍 RQ > 0 的行
+    """阶段4 死冗余检测：经过阶段1+2+3 后仍 RQ > 0 的行
     """
     dead_records = []
     for idx, row in df.iterrows():
@@ -1524,8 +1511,7 @@ def stage4_dead_redundancy_report(df, transit_dict, earliest_etd, target_eta,
 # ============================================================
 def run_full_pipeline(df_baseline, transit_dict, earliest_etd, target_eta,
                       today, sales_cutoff, south_linkage=False):
-    """
-    完整调拨流水线
+    """完整调拨流水线
     返回:
         s1_transfer: 阶段1 冗余调拨记录
         s2_reduce: 阶段2 减量记录
@@ -1578,19 +1564,19 @@ def run_full_pipeline(df_baseline, transit_dict, earliest_etd, target_eta,
 # (本文件实际部署时，会把 step1/2/3 的代码全部内联进来)
 
 st.title("📦 北美全渠道智能分仓控制塔 V3.6.5")
-st.caption("分层双轨调拨版 · 物理真实推演 · 状态机交互")
+st.caption("🎯 分层双轨调拨版 · 物理真实推演 · 状态机交互")
 
 with st.expander("📖 核心指标说明", expanded=False):
     st.markdown("""
     **核心日期**：
-    - 📅 销售截止日：这批货应在该日期前售罄的业务底线日
-    - 📅 最早可发货日期 / 目标上架时间：物流时间窗
+    - 销售截止日：这批货应在该日期前售罄的业务底线日
+    - 最早可发货日期 / 目标上架时间：物流时间窗
 
     **状态指标**（V3.6.5 物理真实推演口径）：
-    - 🚚 预估跨区订单数量：从今天到销售截止日的累计物理跨区订单
-    - 🎯 最终全网占比估值：在 real_final_arrival 当天截取的物理库存占比
-    - 📅 最终全网到货日：最后一批"有货量"到港的事件日期
-    - 📅 预估全网耗尽日：物理全部卖空的日期
+    - 预估跨区订单数量：从今天到销售截止日的累计物理跨区订单
+    - 最终全网占比估值：在 real_final_arrival 当天截取的物理库存占比
+    - 最终全网到货日：最后一批"有货量"到港的事件日期
+    - 预估全网耗尽日：物理全部卖空的日期
 
     **调拨流程**（4 阶段）：
     1. 阶段1 冗余调拨（救命）：把冗余方的货给缺货方
@@ -1619,15 +1605,15 @@ with st.sidebar:
                                value=today + datetime.timedelta(days=37))
 
     if sales_cutoff <= target_eta:
-        st.error("🚨 销售截止日必须晚于目标上架日！请调整。")
+        st.error("销售截止日必须晚于目标上架日！请调整。")
         st.stop()
 
     d_diff = (target_eta - earliest_etd).days
     if d_diff < 0:
         st.error("上架时间不能早于最早发货日期！")
         st.stop()
-    st.success(f"⏳ 物流 D差: {d_diff} 天")
-    st.success(f"📅 销售窗口: {(sales_cutoff - target_eta).days} 天")
+    st.success(f"物流 D差: {d_diff} 天")
+    st.success(f"销售窗口: {(sales_cutoff - target_eta).days} 天")
 
     st.markdown("---")
     st.subheader("🚢 各区海运在途时效（天）")
@@ -1640,7 +1626,7 @@ with st.sidebar:
     }
     d_diff_invalid = d_diff < min(transit_times.values())
     if d_diff_invalid:
-        st.error(f"🚨 极速熔断：D差 ({d_diff}天) 小于最短海运时效 ({min(transit_times.values())}天)！")
+        st.error(f"极速熔断：D差 ({d_diff}天) 小于最短海运时效 ({min(transit_times.values())}天)！")
 
 # ============================================================
 # 数据上传与编辑
@@ -1680,9 +1666,35 @@ with col2:
     uploaded_file = st.file_uploader("⬆️ 上传 Excel/CSV", type=["xlsx", "csv"])
 
 if uploaded_file is not None:
-    df_input = (pd.read_excel(uploaded_file)
-                if uploaded_file.name.endswith('.xlsx')
-                else pd.read_csv(uploaded_file))
+    if uploaded_file.name.endswith('.xlsx'):
+        df_input = pd.read_excel(uploaded_file)
+    else:
+        df_input = pd.read_csv(uploaded_file)
+
+    # 智能表头探测：处理第一行有空行/合并单元格的情况
+    # 检测条件：超过一半的列名是 "Unnamed: N" 形式
+    unnamed_count = sum(1 for c in df_input.columns if str(c).startswith('Unnamed:'))
+    if unnamed_count > len(df_input.columns) / 2:
+        # 找到第一个非全空的行作为真正的表头
+        for header_row_idx in range(min(5, len(df_input))):
+            row_vals = df_input.iloc[header_row_idx].astype(str).tolist()
+            non_empty = sum(1 for v in row_vals if v not in ('nan', '', 'None'))
+            if non_empty > len(df_input.columns) / 2:
+                # 把这行作为表头
+                df_input.columns = [str(v).strip() if str(v) not in ('nan', '', 'None') else f'col_{i}'
+                                    for i, v in enumerate(df_input.iloc[header_row_idx])]
+                # 跳过表头行及之前的空行
+                df_input = df_input.iloc[header_row_idx + 1:].reset_index(drop=True)
+                st.info(f"已自动探测表头位置（原文件第 {header_row_idx + 2} 行为表头）")
+                break
+
+    # 校验：必需列是否齐全
+    required_cols = ['SKU', '店铺', '组别', '运营', '本次总发货量']
+    missing = [c for c in required_cols if c not in df_input.columns]
+    if missing:
+        st.error(f"上传的文件缺少必需列：{missing}")
+        st.write("当前列名：", list(df_input.columns))
+        st.stop()
 else:
     # 默认示例：张三-李四经典互补场景
     df_input = pd.DataFrame({
@@ -1706,8 +1718,7 @@ edited_df = st.data_editor(df_input, num_rows="dynamic", use_container_width=Tru
 # ============================================================
 def compute_main_board(df, transit_dict, earliest_etd, target_eta, today, sales_cutoff,
                        south_linkage=False):
-    """
-    输入：dataframe（含一行或多行 SKU 数据）
+    """输入：dataframe（含一行或多行 SKU 数据）
     输出：每行的主看板指标
     """
     results = []
@@ -1761,22 +1772,22 @@ def compute_main_board(df, transit_dict, earliest_etd, target_eta, today, sales_
             '店铺': row_dict.get('店铺', '-'),
             '组别': row_dict.get('组别', '-'),
             '运营': row_dict.get('运营', '-'),
-            '👉 美西发货': alloc['美西'],
-            '📅 美西最晚发货': fmt_date(deadlines['美西'], alloc['美西']),
-            '👉 美东发货': alloc['美东'],
-            '📅 美东最晚发货': fmt_date(deadlines['美东'], alloc['美东']),
-            '👉 GA发货': alloc['GA'],
-            '📅 GA最晚发货': fmt_date(deadlines['GA'], alloc['GA']),
-            '👉 TX发货': alloc['TX'],
-            '📅 TX最晚发货': fmt_date(deadlines['TX'], alloc['TX']),
-            '👉 CG发货': alloc['CG'],
-            '📅 CG最晚发货': fmt_date(deadlines['CG'], alloc['CG']),
-            '📊 期初分区占比': init_ratio_str,
-            '🎯 最终全网占比估值': final_str,
-            '📅 最终全网到货日': m['real_final_arrival'].strftime('%Y-%m-%d'),
-            '🚚 预估跨区订单数量': int(round(m['cz_before_cutoff'])),
-            '📅 预估全网耗尽日': m['oos_date'].strftime('%Y-%m-%d'),
-            '💡 建议减量至': suggest_qty_str,
+            '美西发货': alloc['美西'],
+            '美西最晚发货': fmt_date(deadlines['美西'], alloc['美西']),
+            '美东发货': alloc['美东'],
+            '美东最晚发货': fmt_date(deadlines['美东'], alloc['美东']),
+            'GA发货': alloc['GA'],
+            'GA最晚发货': fmt_date(deadlines['GA'], alloc['GA']),
+            'TX发货': alloc['TX'],
+            'TX最晚发货': fmt_date(deadlines['TX'], alloc['TX']),
+            'CG发货': alloc['CG'],
+            'CG最晚发货': fmt_date(deadlines['CG'], alloc['CG']),
+            '期初分区占比': init_ratio_str,
+            '最终全网占比估值': final_str,
+            '最终全网到货日': m['real_final_arrival'].strftime('%Y-%m-%d'),
+            '预估跨区订单数量': int(round(m['cz_before_cutoff'])),
+            '预估全网耗尽日': m['oos_date'].strftime('%Y-%m-%d'),
+            '建议减量至': suggest_qty_str,
             '_is_redundant': is_redundant
         })
     return pd.DataFrame(results)
@@ -1800,7 +1811,7 @@ with col_btn3:
     transfer_on = st.checkbox("🔄 启用跨店库存调拨分析", value=False,
                               help="启用后，运算时同步计算 4 阶段调拨方案")
     if transfer_on and agg_on:
-        st.warning("⚠️ 汇总计算和调拨分析互斥（汇总后只剩一行，无法做行间调拨）")
+        st.warning("汇总计算和调拨分析互斥（汇总后只剩一行，无法做行间调拨）")
 with col_btn4:
     btn_run = st.button("🚀 开始逆向推演运算", type="primary")
 
@@ -1825,7 +1836,7 @@ for k in SESSION_KEYS:
 # ============================================================
 if btn_run:
     if d_diff_invalid:
-        st.error("❌ D差小于最短海运时效，无法计算！")
+        st.error("D差小于最短海运时效，无法计算！")
     else:
         # 数据规范化
         working_df = edited_df.copy()
@@ -1841,7 +1852,7 @@ if btn_run:
             if col in working_df.columns:
                 working_df[col] = working_df[col].fillna('-').astype(str)
 
-        # 🆕 同组别同SKU 汇总计算（启用调拨时不允许聚合）
+        # 同组别同SKU 汇总计算（启用调拨时不允许聚合）
         if agg_on and not transfer_on:
             try:
                 working_df = aggregate_data(working_df)
@@ -1849,7 +1860,7 @@ if btn_run:
                 for col in numeric_cols:
                     if col in working_df.columns:
                         working_df[col] = pd.to_numeric(working_df[col], errors='coerce').fillna(0.0).astype(float)
-                st.info(f"✅ 已按【SKU + 组别】汇总，共 {len(working_df)} 行")
+                st.info(f"已按【SKU + 组别】汇总，共 {len(working_df)} 行")
             except Exception as e:
                 st.error(f"汇总计算失败: {e}")
                 st.stop()
@@ -1859,9 +1870,9 @@ if btn_run:
         for _, row in working_df.iterrows():
             total_pct = sum([float(row[ratio_col_name(r)]) for r in REGIONS])
             if not (99.99 <= total_pct <= 100.01):
-                error_skus.append(f"• 【{row['SKU']}】 理论占比和: {total_pct:.1f}%")
+                error_skus.append(f"【{row['SKU']}】 理论占比和: {total_pct:.1f}%")
         if error_skus:
-            st.error("❌ 数据校验失败！以下 SKU 的理论分区占比之和不等于 100%：")
+            st.error("数据校验失败！以下 SKU 的理论分区占比之和不等于 100%：")
             st.warning("\n".join(error_skus))
         else:
             # 清空旧状态
@@ -1890,7 +1901,7 @@ if btn_run:
                         's2_reduce': s2_records,
                     }
 
-            st.success("✅ 计算完成！")
+            st.success("计算完成！")
             st.rerun()
 
 # ============================================================
@@ -1941,11 +1952,11 @@ if st.session_state['alloc_result_s0'] is not None:
     def highlight(row):
         styles = [''] * len(row)
         try:
-            if '🚚 预估跨区订单数量' in row.index and row['🚚 预估跨区订单数量'] > 0:
-                styles[row.index.get_loc('🚚 预估跨区订单数量')] = (
+            if '预估跨区订单数量' in row.index and row['预估跨区订单数量'] > 0:
+                styles[row.index.get_loc('预估跨区订单数量')] = (
                     'background-color: #fff3cd; color: #cc0000; font-weight: bold')
             if '_is_redundant' in row.index and row['_is_redundant']:
-                styles[row.index.get_loc('📅 预估全网耗尽日')] = (
+                styles[row.index.get_loc('预估全网耗尽日')] = (
                     'background-color: #ffcccc; color: #990000; font-weight: bold')
         except (KeyError, ValueError):
             pass
@@ -1961,7 +1972,7 @@ if st.session_state['alloc_result_s0'] is not None:
 
     csv_data = filtered[display_cols].to_csv(index=False).encode('utf-8-sig')
     st.download_button(
-        f"📥 导出当前视图（{stage}）",
+        f"导出当前视图（{stage}）",
         data=csv_data,
         file_name=f'装柜排期_{stage}_{today.strftime("%Y%m%d")}.csv',
         mime='text/csv'
@@ -1985,7 +1996,7 @@ if (st.session_state['current_stage'] == 'S0'
         df_reduce = pd.DataFrame(s2_reduce)
         st.dataframe(df_reduce, use_container_width=True)
     else:
-        st.info("✅ 无需减量：所有 SKU 整体不冗余，或冗余已被冗余调拨完全消化。")
+        st.info("无需减量：所有 SKU 整体不冗余，或冗余已被冗余调拨完全消化。")
 
     # 表2-A：冗余调拨记录
     st.markdown("#### 🔄 表2-A·冗余调拨指令（阶段1）")
@@ -1993,7 +2004,7 @@ if (st.session_state['current_stage'] == 'S0'
         df_t1 = pd.DataFrame(s1_transfer)
         st.dataframe(df_t1, use_container_width=True)
     else:
-        st.info("ℹ️ 无冗余调拨发生（无 SKU 同时存在冗余方与缺货方）。")
+        st.info("无冗余调拨发生（无 SKU 同时存在冗余方与缺货方）。")
 
     # 效果摘要
     if s1_transfer or s2_reduce:
@@ -2074,7 +2085,7 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
         df_t3 = pd.DataFrame(s3_transfer)
         st.dataframe(df_t3, use_container_width=True)
     else:
-        st.info("✅ 无可行分区调拨：当前方案在跨区维度已接近最优。")
+        st.info("无可行分区调拨：当前方案在跨区维度已接近最优。")
 
     # 表3：调拨前后对比
     st.markdown("#### 📊 表3·调拨前后占比与跨区订单对比（基准 = S0 原始基线）")
@@ -2114,7 +2125,7 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
         total_old = sum(r['调拨前跨区单数'] for r in compare_records)
         total_new = sum(r['调拨后跨区单数'] for r in compare_records)
         compare_records.append({
-            'SKU': '🌎 全局汇总',
+            'SKU': '全局汇总',
             '运营-店铺': '-',
             '理论占比 (西:东:GA:TX:CG)': '-',
             '调拨前最终占比': '-',
@@ -2128,7 +2139,7 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
 
         def color_cz(row):
             styles = [''] * len(row)
-            if row['SKU'] == '🌎 全局汇总':
+            if row['SKU'] == '全局汇总':
                 styles = ['background-color: #e6f2ff; font-weight: bold'] * len(row)
             cz_str = str(row['跨区单数改善'])
             if cz_str.startswith('-') and cz_str != '0':
@@ -2150,9 +2161,9 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
             df_dead.style.apply(lambda r: ['background-color: #ffe6e6; color: #990000'] * len(r), axis=1),
             use_container_width=True
         )
-        st.warning("⚠️ 上述 SKU 在调拨完成后仍有无法消化的库存，请关注。")
+        st.warning("上述 SKU 在调拨完成后仍有无法消化的库存，请关注。")
     else:
-        st.success("✅ 无死冗余：所有行都能在销售截止日前售罄。")
+        st.success("无死冗余：所有行都能在销售截止日前售罄。")
 
     # 控制按钮
     st.markdown("---")
@@ -2178,7 +2189,7 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
                 st.session_state['current_stage'] = 'S1'
                 st.rerun()
         with col_a2:
-            if st.button("⏪ 全部撤销，回到原始基线"):
+            if st.button("全部撤销，回到原始基线"):
                 st.session_state['current_stage'] = 'S0'
                 st.rerun()
 
@@ -2190,13 +2201,13 @@ st.header("🕰️ 6. 时空沙盘：穿越任意日期推演")
 
 col_d1, col_d2 = st.columns([1, 4])
 with col_d1:
-    target_query = st.date_input("选择查询日期", value=target_eta, key='sandbox_date')
+    target_query = st.date_input("📅 选择查询日期", value=target_eta, key='sandbox_date')
     sandbox_btn = st.button("🚀 穿越至该日推演", type="secondary")
 
 with col_d2:
     if sandbox_btn:
         if st.session_state['alloc_result_s0'] is None:
-            st.warning("⚠️ 请先点击【开始逆向推演运算】生成方案！")
+            st.warning("请先点击【开始逆向推演运算】生成方案！")
         else:
             stage = st.session_state['current_stage']
 
@@ -2226,9 +2237,9 @@ with col_d2:
                     '店铺': row_dict.get('店铺', '-'),
                     '组别': row_dict.get('组别', '-'),
                     '运营': row_dict.get('运营', '-'),
-                    f'📅 {target_query} 总库存': int(sb['total']),
-                    '🇺🇸 实际占比 (西:东:GA:TX:CG)': " : ".join([f"{pct[r]:.0f}%" for r in REGIONS]),
-                    '🚚 累计跨区订单': int(round(sb['cz_to_end'])),
+                    f'{target_query} 总库存': int(sb['total']),
+                    '实际占比 (西:东:GA:TX:CG)': " : ".join([f"{pct[r]:.0f}%" for r in REGIONS]),
+                    '累计跨区订单': int(round(sb['cz_to_end'])),
                     '美西结存': int(sim_stock['美西']),
                     '美东结存': int(sim_stock['美东']),
                     'GA结存': int(sim_stock['GA']),
@@ -2237,7 +2248,7 @@ with col_d2:
                 })
 
             if sandbox_results:
-                st.success(f"✅ 已推演至 {target_query}（{stage} 数据）")
+                st.success(f"已推演至 {target_query}（{stage} 数据）")
                 st.dataframe(pd.DataFrame(sandbox_results), use_container_width=True)
-                st.caption(f"💡 自洽性提示：当查询日期 = 销售截止日 ({sales_cutoff}) 时，"
+                st.caption(f"自洽性提示：当查询日期 = 销售截止日 ({sales_cutoff}) 时，"
                            f"沙盘累计跨区应等于主看板预估跨区订单数。")

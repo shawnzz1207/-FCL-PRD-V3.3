@@ -123,8 +123,8 @@ def round_preserve_sum(float_dict, target_sum):
 
 
 def row_to_key(row):
-    """组别-运营-店铺 作为行唯一标识"""
-    return f"{row.get('组别', '-')}-{row.get('运营', '-')}-{row.get('店铺', '-')}"
+    """组别-运营/店铺 作为行唯一标识"""
+    return f"{row.get('组别', '-')}-{row.get('运营', '-')}/{row.get('店铺', '-')}"
 
 
 # ============================================================
@@ -568,32 +568,24 @@ def compute_sandbox_metrics(row, alloc_int, transit_dict, earliest_etd, target_e
 # ============================================================
 def compute_row_status(row, transit_dict, earliest_etd, target_eta,
                        today, sales_cutoff, south_linkage=False):
-    """计算一行的核心状态三元组：
+    """
+    计算一行的核心状态三元组：
     - SD: 实际可售天数（从今天到销售截止日，全网物理库存 > 0 的天数）
     - RQ: 剩余冗余量（销售截止日当天的全网物理库存）
     - CZ: 销售截止日前累计跨区订单数
+
+    性能优化：单次推演同时输出 SD/RQ/CZ（替代旧版的 2 次推演）
     """
-    # 先算水池分配（用于推演）
+    # 先算水池分配
     alloc = waterpool_allocation_v2(
         row, transit_dict, earliest_etd, target_eta, today, south_linkage
     )
-    # 物理推演
-    sim = physical_simulation(
-        row if isinstance(row, dict) else row.to_dict(),
-        transit_dict, earliest_etd, target_eta,
-        today, alloc, sales_cutoff, end_date=sales_cutoff
+    # 单次推演同时输出 SD/RQ/CZ
+    row_dict = row if isinstance(row, dict) else row.to_dict()
+    sd, rq, cz, sim_stock_at_cutoff = _compute_sd_rq_cz_in_one_pass(
+        row_dict, alloc, transit_dict, earliest_etd, target_eta,
+        today, sales_cutoff
     )
-
-    # SD 需要额外推演（精确统计"有货天数"）
-    sd = compute_sd(row, alloc, transit_dict, earliest_etd, target_eta,
-                    today, sales_cutoff)
-
-    # RQ = 销售截止日当天的全网物理库存
-    sim_stock_at_cutoff = sim['sim_stock_at_end']
-    rq = sum(sim_stock_at_cutoff.values()) if sim_stock_at_cutoff else 0.0
-
-    # CZ = 销售截止日前累计跨区订单
-    cz = sim['cz_before_cutoff']
 
     return {
         'SD': sd,
@@ -602,6 +594,80 @@ def compute_row_status(row, transit_dict, earliest_etd, target_eta,
         'alloc': alloc,
         'sim_stock_at_cutoff': sim_stock_at_cutoff,
     }
+
+
+def _compute_sd_rq_cz_in_one_pass(row, alloc, transit_dict, earliest_etd, target_eta,
+                                  today, sales_cutoff):
+    """
+    单次物理推演同时算出 SD / RQ / CZ
+    （替代分开调用 physical_simulation 和 compute_sd，性能优化）
+    """
+    arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
+    daily_sales = build_daily_sales_fn(row, today)
+
+    raw_ratios = {r: float(row.get(ratio_col_name(r), 0) or 0) for r in REGIONS}
+    tr = sum(raw_ratios.values())
+    ratios = {r: raw_ratios[r] / tr if tr > 0 else 0.2 for r in REGIONS}
+
+    in_wh = {r: float(row.get(f'{r}_在仓', 0) or 0) for r in REGIONS}
+    in_transits = {r: parse_in_transit(row.get(f'{r}_多批次在途', '')) for r in REGIONS}
+
+    sim_stock = in_wh.copy()
+    sd_count = 0
+    cz_total = 0.0
+    sales_window = (sales_cutoff - today).days
+    sim_stock_at_cutoff = None
+
+    for d_idx in range(1, sales_window + 1):
+        sim_date = today + datetime.timedelta(days=d_idx)
+        # 到港入库
+        for r in REGIONS:
+            if sim_date in in_transits[r]:
+                sim_stock[r] += in_transits[r][sim_date]
+            if sim_date == arrivals[r]:
+                sim_stock[r] += alloc.get(r, 0)
+
+        # 消耗前先看全网总库存（决定 SD）
+        if sum(sim_stock.values()) > 0.001:
+            sd_count += 1
+
+        # 消耗
+        ds = daily_sales(sim_date)
+        ask = {r: 0.0 for r in REGIONS}
+        for r in REGIONS:
+            demand = ds * ratios[r]
+            if sim_stock[r] >= demand:
+                sim_stock[r] -= demand
+            else:
+                ask[r] = demand - sim_stock[r]
+                sim_stock[r] = 0.0
+
+        # 跨区均摊
+        unmet = sum(ask.values())
+        while unmet > 0.001 and sum(sim_stock.values()) > 0.001:
+            donors = [r for r in REGIONS if sim_stock[r] > 0]
+            if not donors:
+                break
+            split = unmet / len(donors)
+            unmet = 0.0
+            for r in donors:
+                if sim_stock[r] >= split:
+                    sim_stock[r] -= split
+                    cz_total += split
+                else:
+                    cz_total += sim_stock[r]
+                    unmet += (split - sim_stock[r])
+                    sim_stock[r] = 0.0
+
+        # 销售截止日当天截取库存（即 sales_window 那天）
+        if d_idx == sales_window:
+            sim_stock_at_cutoff = {r: max(0, sim_stock[r]) for r in REGIONS}
+
+    if sim_stock_at_cutoff is None:
+        sim_stock_at_cutoff = {r: max(0, sim_stock[r]) for r in REGIONS}
+
+    rq = sum(sim_stock_at_cutoff.values())
+    return sd_count, rq, cz_total, sim_stock_at_cutoff
 
 
 def compute_sd(row, alloc, transit_dict, earliest_etd, target_eta,
@@ -1174,8 +1240,8 @@ def binary_search_single_transfer(df, out_idx, in_idx, src_type, src_region, src
                                   transit_dict, earliest_etd, target_eta,
                                   today, sales_cutoff, south_linkage,
                                   baseline_status):
-    """多档位扫描单向调拨最大有效量
-    （ΔCZ 关于调拨量可能非单调，避免二分错失）
+    """
+    多档位扫描单向调拨最大有效量（性能优化：6 档 + 3 档精细化）
     """
     if src_max < 1:
         return 0.0, 0.0
@@ -1183,7 +1249,7 @@ def binary_search_single_transfer(df, out_idx, in_idx, src_type, src_region, src
     best_qty = 0.0
     best_delta = 0.0
 
-    fracs = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 1.00]
+    fracs = [0.10, 0.30, 0.50, 0.70, 0.90, 1.00]
     for frac in fracs:
         q = src_max * frac
         if q < 1:
@@ -1197,9 +1263,9 @@ def binary_search_single_transfer(df, out_idx, in_idx, src_type, src_region, src
             best_delta = delta
             best_qty = q
 
-    # 精细化（最优点附近 ±10%）
+    # 精细化（最优点附近 3 档）
     if best_qty > 0:
-        for adj in [-0.10, -0.05, -0.02, 0.02, 0.05, 0.10]:
+        for adj in [-0.05, 0.05, -0.10]:
             q = best_qty * (1 + adj)
             if q < 1 or q > src_max:
                 continue
@@ -1221,10 +1287,10 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
                                 transit_dict, earliest_etd, target_eta,
                                 today, sales_cutoff, south_linkage,
                                 baseline_status):
-    """多档位扫描双向对调最大有效量
+    """
+    多档位扫描双向对调最大有效量（性能优化：6 档 + 3 档精细化）
 
     重要：ΔCZ 关于调拨量呈 V 字曲线（先降后升），不能用二分。
-    这里用 12 档线性扫描，找最优点。
     """
     cap = min(max_x, max_y)
     if cap < 1:
@@ -1233,8 +1299,7 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
     best_qty = 0.0
     best_delta = 0.0
 
-    # 12 档线性扫描：5%, 10%, 20%, 30%, ..., 100%
-    fracs = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 1.00]
+    fracs = [0.10, 0.30, 0.50, 0.70, 0.90, 1.00]
     for frac in fracs:
         q = cap * frac
         if q < 1:
@@ -1250,9 +1315,9 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
             best_delta = delta
             best_qty = q
 
-    # 在最优档位附近做精细化搜索（前后 ±10% 范围内 5 档）
+    # 精细化（最优点附近 3 档）
     if best_qty > 0:
-        for adj in [-0.10, -0.05, -0.02, 0.02, 0.05, 0.10]:
+        for adj in [-0.05, 0.05, -0.10]:
             q = best_qty * (1 + adj)
             if q < 1 or q > cap:
                 continue
@@ -1275,44 +1340,79 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
 # ============================================================
 def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                               today, sales_cutoff, south_linkage=False):
-    """阶段3 全局贪心分区调拨
+    """
+    阶段3 全局贪心分区调拨（性能优化版）
     返回: (transfer_records, df_after)
+
+    优化点:
+    1. 单 SKU 总 CZ <= 改善阈值 直接跳过（最关键的早退）
+    2. 单 SKU < 2 行直接跳过
+    3. 同区域多批次按到港日聚合代表，避免重复评估
+    4. 降低扫描档位：6 档 + 3 档精细化
     """
     df = df.copy().reset_index(drop=True)
     transfer_records = []
+
+    DELTA_THRESHOLD = 5.0  # 改善阈值
 
     for sku, sku_group in df.groupby('SKU'):
         sku_indices = sku_group.index.tolist()
         if len(sku_indices) < 2:
             continue
 
-        max_iter = 20  # 单SKU迭代上限（避免浮点误差导致的伪迭代）
+        # ===== 早退1: 整 SKU 跨区总和已经很小，没优化空间 =====
+        total_cz_check = 0
+        skip_status_cache = {}
+        for idx in sku_indices:
+            st = compute_row_status(
+                df.loc[idx].to_dict(), transit_dict, earliest_etd, target_eta,
+                today, sales_cutoff, south_linkage
+            )
+            skip_status_cache[idx] = st
+            total_cz_check += st['CZ']
+        if total_cz_check < DELTA_THRESHOLD * 2:  # 整 SKU 跨区不到 10，根本不值得调拨
+            continue
+
+        max_iter = 15  # 迭代上限
+        last_baseline = skip_status_cache  # 复用第一次计算的 baseline
+
         for iter_count in range(max_iter):
-            # 计算所有行的基线状态
-            baseline_status = {}
-            for idx in sku_indices:
-                baseline_status[idx] = compute_row_status(
-                    df.loc[idx].to_dict(), transit_dict, earliest_etd, target_eta,
-                    today, sales_cutoff, south_linkage
-                )
+            # 计算所有行的基线状态（首轮已缓存，后续轮重算）
+            if iter_count == 0:
+                baseline_status = last_baseline
+            else:
+                baseline_status = {}
+                for idx in sku_indices:
+                    baseline_status[idx] = compute_row_status(
+                        df.loc[idx].to_dict(), transit_dict, earliest_etd, target_eta,
+                        today, sales_cutoff, south_linkage
+                    )
 
             # 候选预筛
             single_candidates = filter_partition_candidates(df, sku_indices, baseline_status)
 
             best_action = None
-            best_delta_cz = 5.0  # 改善阈值至少 5 单（避免浮点驱动的伪改善）
+            best_delta_cz = DELTA_THRESHOLD
 
             # ----- 评估单向候选 -----
             for out_idx, in_idx, region in single_candidates:
                 out_row = df.loc[out_idx].to_dict()
-                # 该区可调批次：在仓 + 在途
+                # 该区可调批次：在仓 + 在途（按到港日先后聚合：只取最早可用的代表）
+                # 优化：单向调拨在该区内不同批次只在"到港日"上有差异，
+                #       但锁判定本身已包含日期影响，简化只取总量代表
                 sources = []
                 in_wh = float(out_row.get(f'{region}_在仓', 0))
                 if in_wh > 0.5:
                     sources.append(('在仓', None, in_wh))
-                for dt, qty in parse_in_transit(out_row.get(f'{region}_多批次在途', '')).items():
-                    if qty > 0.5:
-                        sources.append(('在途', dt, qty))
+                # 在途批次按到港日排序，只评估前 2 个（最早 + 最晚），减少候选
+                in_transits_list = [(dt, qty) for dt, qty in
+                                    parse_in_transit(out_row.get(f'{region}_多批次在途', '')).items()
+                                    if qty > 0.5]
+                in_transits_list.sort(key=lambda x: x[0])
+                if in_transits_list:
+                    sources.append(('在途', in_transits_list[0][0], in_transits_list[0][1]))
+                    if len(in_transits_list) > 1:
+                        sources.append(('在途', in_transits_list[-1][0], in_transits_list[-1][1]))
 
                 for src_type, src_date, src_max in sources:
                     qty, delta = binary_search_single_transfer(
@@ -1332,87 +1432,81 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                         }
 
             # ----- 评估双向对调候选 -----
-            # 对每对行 (a, b)，每对不同区域 (X, Y) 试探
+            # 优化：每行 × 每区只保留一个"代表批次"（最早可用且量最大的）
             for i_a, a_idx in enumerate(sku_indices):
                 for b_idx in sku_indices[i_a + 1:]:
                     a_row = df.loc[a_idx].to_dict()
                     b_row = df.loc[b_idx].to_dict()
 
-                    # 双方都需要 CZ > 0 才有对调价值
                     if baseline_status[a_idx]['CZ'] <= 0.5 or baseline_status[b_idx]['CZ'] <= 0.5:
                         continue
 
-                    # 收集双方各区的所有可调批次
-                    a_sources_by_region = {}
-                    b_sources_by_region = {}
-                    for region in TRANSFER_REGIONS:
-                        a_in_wh = float(a_row.get(f'{region}_在仓', 0))
-                        a_sources_by_region[region] = []
-                        if a_in_wh > 0.5:
-                            a_sources_by_region[region].append(('在仓', None, a_in_wh))
-                        for dt, qty in parse_in_transit(a_row.get(f'{region}_多批次在途', '')).items():
-                            if qty > 0.5:
-                                a_sources_by_region[region].append(('在途', dt, qty))
-                        b_in_wh = float(b_row.get(f'{region}_在仓', 0))
-                        b_sources_by_region[region] = []
-                        if b_in_wh > 0.5:
-                            b_sources_by_region[region].append(('在仓', None, b_in_wh))
-                        for dt, qty in parse_in_transit(b_row.get(f'{region}_多批次在途', '')).items():
-                            if qty > 0.5:
-                                b_sources_by_region[region].append(('在途', dt, qty))
+                    # 收集双方各区的代表批次（每区最多 1 个）
+                    def get_rep_source(row, region):
+                        """获取该行该区的代表批次：优先在仓，否则最早到港的在途"""
+                        in_wh = float(row.get(f'{region}_在仓', 0))
+                        if in_wh > 0.5:
+                            return ('在仓', None, in_wh)
+                        in_t = [(dt, qty) for dt, qty in
+                                parse_in_transit(row.get(f'{region}_多批次在途', '')).items()
+                                if qty > 0.5]
+                        if in_t:
+                            in_t.sort(key=lambda x: x[0])
+                            return ('在途', in_t[0][0], in_t[0][1])
+                        return None
 
-                    # 枚举区域对 (X, Y)，X < Y 避免 (X,Y) 和 (Y,X) 重复
+                    a_reps = {r: get_rep_source(a_row, r) for r in TRANSFER_REGIONS}
+                    b_reps = {r: get_rep_source(b_row, r) for r in TRANSFER_REGIONS}
+
+                    # 枚举区域对 (X, Y)，X < Y 避免重复
                     for ix, region_x in enumerate(TRANSFER_REGIONS):
-                        if not a_sources_by_region[region_x]:
+                        if a_reps[region_x] is None:
                             continue
                         for region_y in TRANSFER_REGIONS[ix + 1:]:
-                            if not b_sources_by_region[region_y]:
+                            if b_reps[region_y] is None:
                                 continue
 
-                            # 枚举源批次（A 的 X、B 的 Y）
-                            for type_x, date_x, max_x in a_sources_by_region[region_x]:
-                                for type_y, date_y, max_y in b_sources_by_region[region_y]:
-                                    qty, delta = binary_search_swap_transfer(
-                                        df, a_idx, b_idx,
-                                        type_x, region_x, date_x, max_x,
-                                        type_y, region_y, date_y, max_y,
-                                        transit_dict, earliest_etd, target_eta,
-                                        today, sales_cutoff, south_linkage,
-                                        baseline_status
-                                    )
-                                    if qty < 1:
-                                        continue
-                                    if delta > best_delta_cz:
-                                        best_delta_cz = delta
-                                        best_action = {
-                                            'kind': 'swap',
-                                            'a_idx': a_idx, 'b_idx': b_idx,
-                                            'type_x': type_x, 'region_x': region_x, 'date_x': date_x, 'qty_x': qty,
-                                            'type_y': type_y, 'region_y': region_y, 'date_y': date_y, 'qty_y': qty,
-                                            'delta_cz': delta,
-                                        }
+                            # 主调拨方向: A 的 X → B + B 的 Y → A
+                            type_x, date_x, max_x = a_reps[region_x]
+                            type_y, date_y, max_y = b_reps[region_y]
+                            qty, delta = binary_search_swap_transfer(
+                                df, a_idx, b_idx,
+                                type_x, region_x, date_x, max_x,
+                                type_y, region_y, date_y, max_y,
+                                transit_dict, earliest_etd, target_eta,
+                                today, sales_cutoff, south_linkage, baseline_status
+                            )
+                            if qty >= 1 and delta > best_delta_cz:
+                                best_delta_cz = delta
+                                best_action = {
+                                    'kind': 'swap',
+                                    'a_idx': a_idx, 'b_idx': b_idx,
+                                    'type_x': type_x, 'region_x': region_x, 'date_x': date_x, 'qty_x': qty,
+                                    'type_y': type_y, 'region_y': region_y, 'date_y': date_y, 'qty_y': qty,
+                                    'delta_cz': delta,
+                                }
+
                             # 镜像：A 的 Y → B + B 的 X → A
-                            for type_y, date_y, max_y in a_sources_by_region[region_y]:
-                                for type_x, date_x, max_x in b_sources_by_region[region_x]:
-                                    qty, delta = binary_search_swap_transfer(
-                                        df, b_idx, a_idx,
-                                        type_x, region_x, date_x, max_x,
-                                        type_y, region_y, date_y, max_y,
-                                        transit_dict, earliest_etd, target_eta,
-                                        today, sales_cutoff, south_linkage,
-                                        baseline_status
-                                    )
-                                    if qty < 1:
-                                        continue
-                                    if delta > best_delta_cz:
-                                        best_delta_cz = delta
-                                        best_action = {
-                                            'kind': 'swap',
-                                            'a_idx': b_idx, 'b_idx': a_idx,
-                                            'type_x': type_x, 'region_x': region_x, 'date_x': date_x, 'qty_x': qty,
-                                            'type_y': type_y, 'region_y': region_y, 'date_y': date_y, 'qty_y': qty,
-                                            'delta_cz': delta,
-                                        }
+                            if a_reps[region_y] is None or b_reps[region_x] is None:
+                                continue
+                            type_y2, date_y2, max_y2 = a_reps[region_y]
+                            type_x2, date_x2, max_x2 = b_reps[region_x]
+                            qty, delta = binary_search_swap_transfer(
+                                df, b_idx, a_idx,
+                                type_x2, region_x, date_x2, max_x2,
+                                type_y2, region_y, date_y2, max_y2,
+                                transit_dict, earliest_etd, target_eta,
+                                today, sales_cutoff, south_linkage, baseline_status
+                            )
+                            if qty >= 1 and delta > best_delta_cz:
+                                best_delta_cz = delta
+                                best_action = {
+                                    'kind': 'swap',
+                                    'a_idx': b_idx, 'b_idx': a_idx,
+                                    'type_x': type_x2, 'region_x': region_x, 'date_x': date_x2, 'qty_x': qty,
+                                    'type_y': type_y2, 'region_y': region_y, 'date_y': date_y2, 'qty_y': qty,
+                                    'delta_cz': delta,
+                                }
 
             if best_action is None:
                 break
@@ -1437,10 +1531,8 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                     '备注': f"降跨区 {int(round(ba['delta_cz']))} 单",
                 })
             else:  # swap
-                # X 方向: A→B
                 actual_x = apply_transfer(df, ba['a_idx'], ba['b_idx'],
                                           ba['type_x'], ba['region_x'], ba['date_x'], ba['qty_x'])
-                # Y 方向: B→A
                 actual_y = apply_transfer(df, ba['b_idx'], ba['a_idx'],
                                           ba['type_y'], ba['region_y'], ba['date_y'], ba['qty_y'])
                 if actual_x < 1 or actual_y < 1:

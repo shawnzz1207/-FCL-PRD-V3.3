@@ -1909,16 +1909,18 @@ with col_btn4:
 
 # Session State 初始化
 SESSION_KEYS = [
-    'baseline_df',  # S0 数据源（原始数据）
-    'stage12_df',  # S1 数据源（阶段1+2 完成）
-    'stage34_df',  # S2 数据源（阶段3+4 完成）
-    'alloc_result_s0',  # S0 主看板
-    'alloc_result_s1',  # S1 主看板
-    'alloc_result_s2',  # S2 主看板
-    'current_stage',  # 'S0' / 'S1' / 'S2'
-    's12_records',  # 阶段1+2 记录（表1+表2-A）
-    's34_records',  # 阶段3+4 记录（表2-B + 表4 + 对比表）
+    'baseline_df',
+    'stage12_df',
+    'stage34_df',
+    'alloc_result_s0',
+    'alloc_result_s1',
+    'alloc_result_s2',
+    'current_stage',
+    's12_records',
+    's34_records',
+    'independent_mode',  # 新增:标记是否走"仅运算分区调拨"独立路径
 ]
+
 for k in SESSION_KEYS:
     if k not in st.session_state:
         st.session_state[k] = None
@@ -2002,14 +2004,20 @@ if btn_run:
 if st.session_state['alloc_result_s0'] is not None:
     stage = st.session_state['current_stage']
 
-    # 状态标签
-    stage_label_map = {
-        'S0': "📊 当前显示：**原始基线方案**",
-        'S1': "📊 当前显示：**救命+减量后的方案**（阶段1+2 完成）",
-        'S2': "📊 当前显示：**完整调拨方案**（阶段3 完成）"
-    }
+    # 状态标签(独立模式和完整流程用不同文案)
+    if st.session_state.get('independent_mode'):
+        stage_label_map = {
+            'S0': "📊 当前显示：**原始基线方案**",
+            'S1': "📊 当前显示：**S0 原始基线**（独立模式,主看板未变化,分区调拨方案见下方）",
+            'S2': "📊 当前显示：**S0 + 分区调拨方案**（独立模式,跳过了阶段1+2）"
+        }
+    else:
+        stage_label_map = {
+            'S0': "📊 当前显示：**原始基线方案**",
+            'S1': "📊 当前显示：**救命+减量后的方案**（阶段1+2 完成）",
+            'S2': "📊 当前显示：**完整调拨方案**（阶段3 完成）"
+        }
     st.info(stage_label_map[stage])
-
     # 选择展示哪一份数据
     if stage == 'S0':
         cached_result = st.session_state['alloc_result_s0']
@@ -2131,11 +2139,11 @@ if (st.session_state['current_stage'] == 'S0'
                       delta=f"{int(after_total_short - baseline_total_short)}",
                       delta_color="inverse")
 
-    # 控制按钮
+    # 控制按钮（必须在 if s1_transfer or s2_reduce 外面,否则没救命方案时按钮消失）
     st.markdown("---")
     col_b1, col_b2 = st.columns([1, 1])
     with col_b1:
-        if st.button("✅ 确认救命方案，主看板刷新并继续优化", type="primary"):
+        if st.button("✅ 确认救命方案,主看板刷新并继续优化", type="primary"):
             with st.spinner("正在刷新主看板 + 计算阶段3+4..."):
                 # 主看板基于 stage12_df 刷新
                 st.session_state['alloc_result_s1'] = compute_main_board(
@@ -2158,6 +2166,31 @@ if (st.session_state['current_stage'] == 'S0'
                     's4_dead': s4_dead,
                 }
                 st.session_state['current_stage'] = 'S1'
+                st.session_state['independent_mode'] = False  # 完整流程
+            st.rerun()
+    with col_b2:
+        if st.button("⚡ 仅运算分区调拨", type="secondary",
+                     help="跳过救命方案,直接基于 S0 原始数据运算分区调拨"):
+            with st.spinner("正在基于 S0 原始数据运算分区调拨..."):
+                # 主看板复用 S0 数据(因为没经过阶段1+2,数据未变)
+                st.session_state['alloc_result_s1'] = st.session_state['alloc_result_s0'].copy()
+
+                # 直接对 baseline_df 跑阶段3+4
+                s3_transfer, df_after_s3 = stage3_partition_transfer(
+                    st.session_state['baseline_df'], transit_times,
+                    earliest_etd, target_eta, today, sales_cutoff, south_linkage
+                )
+                s4_dead = stage4_dead_redundancy_report(
+                    df_after_s3, transit_times, earliest_etd, target_eta,
+                    today, sales_cutoff, south_linkage
+                )
+                st.session_state['stage34_df'] = df_after_s3
+                st.session_state['s34_records'] = {
+                    's3_transfer': s3_transfer,
+                    's4_dead': s4_dead,
+                }
+                st.session_state['current_stage'] = 'S1'
+                st.session_state['independent_mode'] = True  # 独立路径标记
             st.rerun()
 
 # ============================================================
@@ -2165,7 +2198,11 @@ if (st.session_state['current_stage'] == 'S0'
 # ============================================================
 if st.session_state['current_stage'] in ('S1', 'S2'):
     st.markdown("---")
-    st.header("⚖️ 5. 阶段3+4：降本与死冗余报告")
+    st.header("⚖️ 5. 阶段3+4:降本与死冗余报告")
+
+    # 状态提示:区分独立路径和完整路径
+    if st.session_state.get('independent_mode'):
+        st.warning("🔵 当前为【仅运算分区调拨】独立模式:基于 S0 原始数据,跳过了阶段1+2 救命方案。")
 
     s34 = st.session_state.get('s34_records', {})
     s3_transfer = s34.get('s3_transfer', [])
@@ -2189,7 +2226,6 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
             continue
         old_row = baseline.loc[idx].to_dict()
         new_row = final_df.loc[idx].to_dict()
-        # 用 compute_row_metrics 拿最终占比和跨区
         m_old = compute_row_metrics(old_row, transit_times, earliest_etd, target_eta,
                                     today, sales_cutoff, south_linkage)
         m_new = compute_row_metrics(new_row, transit_times, earliest_etd, target_eta,
@@ -2209,11 +2245,10 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
             '调拨后最终占比': ":".join([f"{new_ratio[r]:.0f}" for r in REGIONS]),
             '调拨前跨区单数': old_cz,
             '调拨后跨区单数': new_cz,
-            '跨区单数改善': f"{-cz_improve:+d}" if cz_improve != 0 else "0",
+            '跨区单数改善': f"{cz_improve:+d}" if cz_improve != 0 else "0",
         })
 
     if compare_records:
-        # 加全局汇总
         total_old = sum(r['调拨前跨区单数'] for r in compare_records)
         total_new = sum(r['调拨后跨区单数'] for r in compare_records)
         compare_records.append({
@@ -2234,10 +2269,12 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
             if row['SKU'] == '全局汇总':
                 styles = ['background-color: #e6f2ff; font-weight: bold'] * len(row)
             cz_str = str(row['跨区单数改善'])
-            if cz_str.startswith('-') and cz_str != '0':
+            if cz_str.startswith('+'):
+                # 正数 = 变好 → 绿色
                 idx_loc = row.index.get_loc('跨区单数改善')
                 styles[idx_loc] += '; color: #70AD47; font-weight: bold'
-            elif cz_str.startswith('+'):
+            elif cz_str.startswith('-') and cz_str != '0':
+                # 负数 = 变坏 → 红色
                 idx_loc = row.index.get_loc('跨区单数改善')
                 styles[idx_loc] += '; color: #C00000; font-weight: bold'
             return styles
@@ -2245,17 +2282,23 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
 
         st.dataframe(df_cmp.style.apply(color_cz, axis=1), use_container_width=True)
 
-    # 表4：死冗余报告
-    st.markdown("#### 🔴 表4·死冗余预警（阶段4）")
+    # 表4:死冗余报告（必须在 if compare_records 外面,独立显示）
+    if st.session_state.get('independent_mode'):
+        st.markdown("#### 🟠 表4·剩余冗余报告(阶段4,独立模式)")
+        st.info("⚠️ 当前为独立模式,未经阶段2 减量,以下「剩余冗余量」包含原始冗余,数据可能虚高,仅供参考。")
+    else:
+        st.markdown("#### 🔴 表4·死冗余预警(阶段4)")
+
     if s4_dead:
         df_dead = pd.DataFrame(s4_dead)
         st.dataframe(
             df_dead.style.apply(lambda r: ['background-color: #ffe6e6; color: #990000'] * len(r), axis=1),
             use_container_width=True
         )
-        st.warning("上述 SKU 在调拨完成后仍有无法消化的库存，请关注。")
+        if not st.session_state.get('independent_mode'):
+            st.warning("上述 SKU 在调拨完成后仍有无法消化的库存,请关注。")
     else:
-        st.success("无死冗余：所有行都能在销售截止日前售罄。")
+        st.success("无死冗余:所有行都能在销售截止日前售罄。")
 
     # 控制按钮
     st.markdown("---")
@@ -2275,15 +2318,22 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
                 st.session_state['current_stage'] = 'S0'
                 st.rerun()
     else:  # S2
-        col_a1, col_a2 = st.columns([1, 1])
-        with col_a1:
-            if st.button("↩️ 撤销分区调拨，回到救命方案"):
-                st.session_state['current_stage'] = 'S1'
-                st.rerun()
-        with col_a2:
-            if st.button("全部撤销，回到原始基线"):
+        if st.session_state.get('independent_mode'):
+            # 独立模式:只有"全部撤销"按钮(因为没有救命方案可回)
+            if st.button("⏪ 全部撤销,回到原始基线"):
                 st.session_state['current_stage'] = 'S0'
                 st.rerun()
+        else:
+            # 完整流程:两个撤销按钮都显示
+            col_a1, col_a2 = st.columns([1, 1])
+            with col_a1:
+                if st.button("↩️ 撤销分区调拨,回到救命方案"):
+                    st.session_state['current_stage'] = 'S1'
+                    st.rerun()
+            with col_a2:
+                if st.button("全部撤销,回到原始基线"):
+                    st.session_state['current_stage'] = 'S0'
+                    st.rerun()
 
 # ============================================================
 # 时空沙盘
@@ -2307,7 +2357,11 @@ with col_d2:
             if stage == 'S0':
                 working_df = st.session_state['baseline_df']
             elif stage == 'S1':
-                working_df = st.session_state['stage12_df']
+                # 独立模式下没经过阶段1+2,stage12_df 是 None,要用 baseline_df
+                if st.session_state.get('independent_mode'):
+                    working_df = st.session_state['baseline_df']
+                else:
+                    working_df = st.session_state['stage12_df']
             else:
                 working_df = st.session_state['stage34_df']
 

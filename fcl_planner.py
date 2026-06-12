@@ -729,7 +729,66 @@ def compute_sd(row, alloc, transit_dict, earliest_etd, target_eta,
                     sim_stock[r] = 0.0
 
     return sd_count
+# ============================================================
+# V3.7a 新增: 推荐发货量引擎(解析法)
+# ============================================================
+def recommend_q_ship(row_dict, transit_dict, earliest_etd, target_eta,
+                     today, sales_cutoff, south_linkage=False,
+                     tol=1.0, max_iter=4):
+    """推荐发货量: 目标为销售截止日当天 RQ ≈ 0(刚好售罄)
 
+    算法(解析法, 每行仅 2-4 次推演):
+      步骤1: q=0 推演 → RQ>0 说明现有库存已冗余, 推荐 0
+      步骤2: q=Q_max(销售窗口总需求) 推演 → q* = Q_max - RQ_max
+             (超出网络消化能力的部分 1:1 变成剩余, 解析反推)
+      步骤3: 用 q* 验证, 若 RQ 仍超容差则牛顿式修正 q* -= RQ
+
+    Returns:
+        (q_final, q_raw, status)
+        q_final: 最终推荐量(已应用 1-9 归零规则)
+        q_raw:   修正前的原始推荐量(用于归零提示)
+        status:  'redundant' 已冗余 / 'ok' 正常 / 'small' 1-9被归零
+    """
+    work = dict(row_dict)
+
+    # ---- 步骤1: q=0 ----
+    work['本次总发货量'] = 0.0
+    st0 = compute_row_status(work, transit_dict, earliest_etd, target_eta,
+                             today, sales_cutoff, south_linkage)
+    if st0['RQ'] > 0.5:
+        return 0, 0, 'redundant'
+
+    # ---- 步骤2: q=Q_max 解析反推 ----
+    daily_sales = build_daily_sales_fn(row_dict, today)
+    sales_window = (sales_cutoff - today).days
+    q_max = sum(daily_sales(today + datetime.timedelta(days=i))
+                for i in range(1, sales_window + 1))
+    q_max = float(int(q_max) + 10)
+
+    if q_max <= 0.5:
+        return 0, 0, 'ok'
+
+    work['本次总发货量'] = q_max
+    st_max = compute_row_status(work, transit_dict, earliest_etd, target_eta,
+                                today, sales_cutoff, south_linkage)
+    q_star = q_max - st_max['RQ']
+
+    # ---- 步骤3: 验证 + 牛顿式修正 ----
+    for _ in range(max_iter):
+        if q_star <= 0.5:
+            q_star = 0.0
+            break
+        work['本次总发货量'] = q_star
+        st_v = compute_row_status(work, transit_dict, earliest_etd, target_eta,
+                                  today, sales_cutoff, south_linkage)
+        if st_v['RQ'] <= tol:
+            break
+        q_star -= st_v['RQ']
+
+    q_raw = max(0, int(round(q_star)))
+    if 1 <= q_raw <= 9:
+        return 0, q_raw, 'small'
+    return q_raw, q_raw, 'ok'
 
 # ============================================================
 # 调拨执行函数（带物理上限保护）
@@ -1655,7 +1714,7 @@ def run_full_pipeline(df_baseline, transit_dict, earliest_etd, target_eta,
 # ============================================================
 # (本文件实际部署时，会把 step1/2/3 的代码全部内联进来)
 
-st.title("📦 北美全渠道智能分仓控制塔 V3.6.5")
+st.title("📦 北美全渠道智能库存计算器 V3.7.0")
 st.caption("🎯 分层双轨调拨版 · 物理真实推演 · 状态机交互")
 
 with st.expander("📖 核心指标说明", expanded=False):
@@ -1664,7 +1723,7 @@ with st.expander("📖 核心指标说明", expanded=False):
     - 销售截止日：这批货应在该日期前售罄的业务底线日
     - 最早可发货日期 / 目标上架时间：物流时间窗
 
-    **状态指标**（V3.6.5 物理真实推演口径）：
+    **状态指标**：
     - 预估跨区订单数量：从今天到销售截止日的累计物理跨区订单
     - 最终全网占比估值：在 real_final_arrival 当天截取的物理库存占比
     - 最终全网到货日：最后一批"有货量"到港的事件日期
@@ -1802,7 +1861,108 @@ else:
         'M4预测(第4月)': [1000, 1000], 'M5预测(第5月)': [1000, 1000]
     })
 
-edited_df = st.data_editor(df_input, num_rows="dynamic", use_container_width=True)
+# ============================================================
+# V3.7a: 推荐发货量结果优先作为编辑器数据源
+# 注意: recommended_df / rec_version / recommend_msgs 三个 key
+#       不要加入 SESSION_KEYS, 否则点运算按钮会清掉推荐结果
+# ============================================================
+if st.session_state.get('recommended_df') is not None:
+    df_input = st.session_state['recommended_df']
+
+# 归零/冗余提示(精简为一行汇总, 明细看表格「备注」列)
+rec_msgs = st.session_state.get('recommend_msgs')
+if rec_msgs:
+    parts = []
+    if rec_msgs.get('small_count'):
+        parts.append(f"{rec_msgs['small_count']} 行需求 1-9 pcs 已归零(如需发货请手动改为 ≥10)")
+    if rec_msgs.get('redundant_count'):
+        parts.append(f"{rec_msgs['redundant_count']} 行库存已冗余(推荐 0)")
+    if parts:
+        st.warning("⚠️ " + "; ".join(parts) + "。明细见表格「备注」列。")
+
+edited_df = st.data_editor(df_input, num_rows="dynamic", use_container_width=True,
+                           key=f"main_editor_v{st.session_state.get('rec_version', 0)}")
+
+# ============================================================
+# V3.7a: 生成推荐发货量按钮
+# ============================================================
+col_rec1, col_rec2 = st.columns([1, 3])
+with col_rec1:
+    btn_recommend = st.button(
+        "🧮 生成推荐发货量", type="secondary",
+        help="基于在仓+在途+销售预测, 反推「刚好在销售截止日售罄」的发货量, "
+             "结果写入上方表格的「本次总发货量」列, 可手动修改后再运算。"
+             "如需安全库存, 请将侧边栏的销售截止日相应后移。"
+    )
+with col_rec2:
+    st.caption("推荐目标: 销售截止日当天剩余库存 ≈ 0。生成后可在表格中逐行检查、修改, 再点「开始逆向推演运算」。")
+
+if btn_recommend:
+    if d_diff_invalid:
+        st.error("D差小于最短海运时效, 无法计算推荐发货量!")
+    else:
+        rec_df = edited_df.copy()
+        # 重复生成时, 先移除旧备注列
+        if '备注' in rec_df.columns:
+            rec_df = rec_df.drop(columns=['备注'])
+
+        # 数值规范化(与主运算同口径)
+        rec_numeric_cols = (['本次总发货量']
+                            + [ratio_col_name(r) for r in REGIONS]
+                            + [f'{r}_在仓' for r in REGIONS]
+                            + ['M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)',
+                               'M4预测(第4月)', 'M5预测(第5月)'])
+        for col in rec_numeric_cols:
+            if col in rec_df.columns:
+                rec_df[col] = pd.to_numeric(rec_df[col], errors='coerce').fillna(0.0).astype(float)
+        for col in ['SKU', '店铺', '组别', '运营']:
+            if col in rec_df.columns:
+                rec_df[col] = rec_df[col].fillna('-').astype(str)
+
+        # 校验理论占比和 = 100
+        rec_errors = []
+        for _, row in rec_df.iterrows():
+            total_pct = sum([float(row[ratio_col_name(r)]) for r in REGIONS])
+            if not (99.99 <= total_pct <= 100.01):
+                rec_errors.append(f"【{row['SKU']}】理论占比和: {total_pct:.1f}%")
+        if rec_errors:
+            st.error("数据校验失败! 以下 SKU 的理论分区占比之和不等于 100%:")
+            st.warning("\n".join(rec_errors))
+        else:
+            n_rows = len(rec_df)
+            prog = st.progress(0, text=f"正在计算推荐发货量... 0/{n_rows}")
+            notes = []
+            small_count = 0
+            redundant_count = 0
+            for i, (idx, row) in enumerate(rec_df.iterrows()):
+                q_final, q_raw, status = recommend_q_ship(
+                    row.to_dict(), transit_times, earliest_etd, target_eta,
+                    today, sales_cutoff, False
+                )
+                rec_df.at[idx, '本次总发货量'] = float(q_final)
+                if status == 'small':
+                    notes.append(f"需求{q_raw}pcs已归零")
+                    small_count += 1
+                elif status == 'redundant':
+                    notes.append("库存已冗余")
+                    redundant_count += 1
+                else:
+                    notes.append("")
+                prog.progress((i + 1) / n_rows,
+                              text=f"正在计算推荐发货量... {i + 1}/{n_rows}")
+            prog.empty()
+
+            # 备注列插入「本次总发货量」之后(即与理论_西% 之间)
+            insert_pos = rec_df.columns.get_loc('本次总发货量') + 1
+            rec_df.insert(insert_pos, '备注', notes)
+
+            st.session_state['recommended_df'] = rec_df
+            st.session_state['rec_version'] = st.session_state.get('rec_version', 0) + 1
+            st.session_state['recommend_msgs'] = {
+                'small_count': small_count,
+                'redundant_count': redundant_count,
+            }
+            st.rerun()
 
 
 # ============================================================
@@ -1934,6 +2094,13 @@ if btn_run:
     else:
         # 数据规范化
         working_df = edited_df.copy()
+
+        # V3.7a: 提取并剔除「备注」列(算法引擎不使用; 仅 S0 主看板回显)
+        row_notes = None
+        if '备注' in working_df.columns:
+            row_notes = working_df['备注'].fillna('').astype(str).tolist()
+            working_df = working_df.drop(columns=['备注'])
+
         numeric_cols = (['本次总发货量']
                         + [ratio_col_name(r) for r in REGIONS]
                         + [f'{r}_在仓' for r in REGIONS]
@@ -1950,6 +2117,7 @@ if btn_run:
         if agg_on and not transfer_on:
             try:
                 working_df = aggregate_data(working_df)
+                row_notes = None  # V3.7a: 聚合后行数变化, 备注失效
                 # 聚合后再次保证数值列类型
                 for col in numeric_cols:
                     if col in working_df.columns:
@@ -1976,10 +2144,14 @@ if btn_run:
             # 计算 S0：基线方案
             with st.spinner("正在计算 S0 基线方案..."):
                 st.session_state['baseline_df'] = working_df.copy()
-                st.session_state['alloc_result_s0'] = compute_main_board(
+                board_s0 = compute_main_board(
                     working_df, transit_times, earliest_etd, target_eta,
                     today, sales_cutoff, south_linkage
                 )
+                # V3.7a: S0 主看板回显备注(放「运营」列后); S1/S2 刷新后自然消失
+                if row_notes is not None and len(row_notes) == len(board_s0):
+                    board_s0.insert(board_s0.columns.get_loc('运营') + 1, '备注', row_notes)
+                st.session_state['alloc_result_s0'] = board_s0
                 st.session_state['current_stage'] = 'S0'
 
             # 若启用调拨：跑阶段1+2，把结果暂存（等用户点击"确认救命方案"才进入 S1）
@@ -2172,8 +2344,11 @@ if (st.session_state['current_stage'] == 'S0'
         if st.button("⚡ 仅运算分区调拨", type="secondary",
                      help="跳过救命方案,直接基于 S0 原始数据运算分区调拨"):
             with st.spinner("正在基于 S0 原始数据运算分区调拨..."):
-                # 主看板复用 S0 数据(因为没经过阶段1+2,数据未变)
-                st.session_state['alloc_result_s1'] = st.session_state['alloc_result_s0'].copy()
+                # 主看板复用 S0 数据(剔除备注: 进入后续运算后备注消失)
+                _s1_board = st.session_state['alloc_result_s0'].copy()
+                if '备注' in _s1_board.columns:
+                    _s1_board = _s1_board.drop(columns=['备注'])
+                st.session_state['alloc_result_s1'] = _s1_board
 
                 # 直接对 baseline_df 跑阶段3+4
                 s3_transfer, df_after_s3 = stage3_partition_transfer(

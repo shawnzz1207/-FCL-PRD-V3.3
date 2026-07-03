@@ -5,6 +5,7 @@ import datetime
 import calendar
 import copy
 import io
+import math
 import streamlit as st
 
 # 设置宽布局（必须是第一个 streamlit 命令）
@@ -14,6 +15,10 @@ st.set_page_config(page_title="北美全渠道智能分仓系统 V3.6.5", layout
 # ============================================================
 REGIONS = ['美西', '美东', 'GA', 'TX', 'CG']
 TRANSFER_REGIONS = ['美西', '美东', 'GA', 'TX']  # CG 不参与调拨
+FORECAST_COLS = [
+    'M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)',
+    'M4预测(第4月)', 'M5预测(第5月)', 'M6预测(第6月)'
+]
 
 
 # ============================================================
@@ -102,8 +107,8 @@ def aggregate_data(df):
             row[f'{r}_在仓'] = group_df[f'{r}_在仓'].sum()
             row[f'{r}_多批次在途'] = merge_in_transits(group_df[f'{r}_多批次在途'])
         # 月度预测求和
-        for m in ['M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)', 'M4预测(第4月)', 'M5预测(第5月)']:
-            row[m] = group_df[m].sum()
+        for m in FORECAST_COLS:
+            row[m] = group_df[m].sum() if m in group_df.columns else 0.0
         grouped_records.append(row)
     return pd.DataFrame(grouped_records)
 
@@ -161,20 +166,18 @@ def compute_deadlines(transit_dict, earliest_etd, target_eta):
 
 
 def build_daily_sales_fn(row, today):
-    """根据行的 M1-M5 预测，返回一个 daily_sales(date) 函数"""
-    forecasts = (
-        float(row.get('M1预测(当月)', 0) or 0),
-        float(row.get('M2预测(次月)', 0) or 0),
-        float(row.get('M3预测(第3月)', 0) or 0),
-        float(row.get('M4预测(第4月)', 0) or 0),
-        float(row.get('M5预测(第5月)', 0) or 0),
-    )
+    """根据行的 M1-M6 预测，返回一个 daily_sales(date) 函数"""
+    forecasts = tuple(float(row.get(col, 0) or 0) for col in FORECAST_COLS)
+
+    # 全段无销售预测时按真实零日销处理，避免被误判为缺货方。
+    if sum(forecasts) <= 0:
+        return lambda d_obj: 0.0
 
     def daily_sales(d_obj):
         m_diff = (d_obj.year - today.year) * 12 + d_obj.month - today.month
-        m_idx = min(max(m_diff, 0), 4)
+        m_idx = min(max(m_diff, 0), len(forecasts) - 1)
         days_in_m = calendar.monthrange(d_obj.year, d_obj.month)[1]
-        return max(forecasts[m_idx] / days_in_m, 0.1)
+        return max(forecasts[m_idx] / days_in_m, 0.01)
 
     return daily_sales
 
@@ -746,7 +749,7 @@ def recommend_q_ship(row_dict, transit_dict, earliest_etd, target_eta,
     Returns:
         (q_final, q_raw, status)
         q_final: 最终推荐量(已应用 1-9 归零规则)
-        q_raw:   修正前的原始推荐量(用于归零提示)
+        q_raw:   应用 1-9 归零前的整数推荐量(用于归零提示)
         status:  'redundant' 已冗余 / 'ok' 正常 / 'small' 1-9被归零
     """
     work = dict(row_dict)
@@ -785,7 +788,20 @@ def recommend_q_ship(row_dict, transit_dict, earliest_etd, target_eta,
             break
         q_star -= st_v['RQ']
 
+    # ---- 步骤4: 整数取整后复核 ----
+    # 四舍五入可能重新产生 0.5-1 件余量；按整数件下调，避免阶段2再次减 1。
     q_raw = max(0, int(round(q_star)))
+    for _ in range(max_iter):
+        if q_raw <= 0:
+            break
+        work['本次总发货量'] = float(q_raw)
+        st_int = compute_row_status(work, transit_dict, earliest_etd, target_eta,
+                                    today, sales_cutoff, south_linkage)
+        if st_int['RQ'] <= 0.5:
+            break
+        adjustment = max(1, int(math.ceil(st_int['RQ'] - 0.5)))
+        q_raw = max(0, q_raw - adjustment)
+
     if 1 <= q_raw <= 9:
         return 0, q_raw, 'small'
     return q_raw, q_raw, 'ok'
@@ -873,6 +889,42 @@ def get_stock_sources(row_dict):
     return sources
 
 
+def _row_status_cache_key(row_dict):
+    """提取影响库存状态的字段，供阶段1复用相同试探结果。"""
+    status_cols = (
+        ['本次总发货量']
+        + [ratio_col_name(r) for r in REGIONS]
+        + [f'{r}_在仓' for r in REGIONS]
+        + [f'{r}_多批次在途' for r in REGIONS]
+        + FORECAST_COLS
+    )
+    values = []
+    for col in status_cols:
+        value = row_dict.get(col)
+        try:
+            if pd.isna(value):
+                value = None
+        except (TypeError, ValueError):
+            value = repr(value)
+        try:
+            hash(value)
+        except TypeError:
+            value = repr(value)
+        values.append(value)
+    return tuple(values)
+
+
+def _compute_row_status_cached(row_dict, transit_dict, earliest_etd, target_eta,
+                               today, sales_cutoff, south_linkage, status_cache):
+    key = _row_status_cache_key(row_dict)
+    if key not in status_cache:
+        status_cache[key] = compute_row_status(
+            row_dict, transit_dict, earliest_etd, target_eta,
+            today, sales_cutoff, south_linkage
+        )
+    return status_cache[key]
+
+
 # ============================================================
 # 阶段1：冗余调拨
 # ============================================================
@@ -889,15 +941,16 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
         sku_indices = sku_group.index.tolist()
         if len(sku_indices) < 2:
             continue
+        status_cache = {}
 
         max_iter = 50
         for iter_count in range(max_iter):
             # 计算当前所有行的状态
             status = {}
             for idx in sku_indices:
-                st = compute_row_status(
+                st = _compute_row_status_cached(
                     df.loc[idx].to_dict(), transit_dict, earliest_etd, target_eta,
-                    today, sales_cutoff, south_linkage
+                    today, sales_cutoff, south_linkage, status_cache
                 )
                 status[idx] = st
 
@@ -907,8 +960,10 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
             # 缺货方：SD < 销售窗口天数（过程中存在断货，不论 RQ）
             #   - 包含真·缺货方（RQ=0，整体卖空）
             #   - 包含等待期伪缺货方（RQ>0，但启动期/中途有空窗）
+            # 全段预测为 0 的行没有销售需求，不进入调入候选。
             shortage = [idx for idx in sku_indices
-                        if status[idx]['SD'] < sales_window - 0.5]
+                        if sum(float(df.at[idx, col]) for col in FORECAST_COLS) > 0
+                        and status[idx]['SD'] < sales_window - 0.5]
 
             if not redundant or not shortage:
                 break
@@ -936,7 +991,7 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
                             df, g_idx, r_idx, src_type, src_region, src_date, src_max,
                             transit_dict, earliest_etd, target_eta,
                             today, sales_cutoff, south_linkage,
-                            sales_window, status[g_idx], status[r_idx]
+                            sales_window, status[g_idx], status[r_idx], status_cache
                         )
 
                         if best_qty < 1:
@@ -951,9 +1006,9 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
                             restore_rows(df, backup)
                             continue
 
-                        r_status_new = compute_row_status(
+                        r_status_new = _compute_row_status_cached(
                             df.loc[r_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-                            today, sales_cutoff, south_linkage
+                            today, sales_cutoff, south_linkage, status_cache
                         )
                         delta_sd = r_status_new['SD'] - r_status_old['SD']
 
@@ -1002,19 +1057,22 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
 def binary_search_max_transfer(df, g_idx, r_idx, src_type, src_region, src_date, src_max,
                                transit_dict, earliest_etd, target_eta,
                                today, sales_cutoff, south_linkage,
-                               sales_window, g_status, r_status):
+                               sales_window, g_status, r_status, status_cache=None):
     """二分搜索：找出"3 重锁"下最大的可调拨量
     锁1: qty <= src_max （物理上限）  → 已在 apply_transfer 保护
     锁2: 调出方调出后 SD 不下降（不变得"更缺货"）
-    锁3: 调入方调入后 RQ 不增加（在缺货等待期内消耗的货才合法）
-         - 若调入量 ≤ 等待期销量需求 → 货全部在等待期消耗 → RQ 不变 → 通过
-         - 若调入量 > 等待期销量需求 → 多余货进入售卖期 → RQ 增加 → 拒绝
+    锁3: 调入方调入后不产生新的可减冗余
+         - 原 RQ ≤ 0.5 时，调入后 RQ 最高为 0.5
+         - 原 RQ > 0.5 时，调入后 RQ 不得超过原值
     """
     lo = 0.0
     hi = float(src_max)
     best = 0.0
     g_baseline_sd = g_status['SD']
     r_baseline_rq = r_status['RQ']
+    r_rq_limit = max(r_baseline_rq, 0.5)
+    if status_cache is None:
+        status_cache = {}
 
     for _ in range(15):
         if hi - lo < 1:
@@ -1031,21 +1089,21 @@ def binary_search_max_transfer(df, g_idx, r_idx, src_type, src_region, src_date,
             continue
 
         # 评估锁2 & 锁3
-        g_new = compute_row_status(
+        g_new = _compute_row_status_cached(
             df.loc[g_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-            today, sales_cutoff, south_linkage
+            today, sales_cutoff, south_linkage, status_cache
         )
-        r_new = compute_row_status(
+        r_new = _compute_row_status_cached(
             df.loc[r_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-            today, sales_cutoff, south_linkage
+            today, sales_cutoff, south_linkage, status_cache
         )
 
         restore_rows(df, backup)
 
         # 锁2: 调出方 SD 不下降（不变得更缺货）
         lock2_ok = (g_new['SD'] >= g_baseline_sd - 0.5)
-        # 锁3: 调入方 RQ 不超过基线（保证等待期内消耗）
-        lock3_ok = (r_new['RQ'] <= r_baseline_rq + 0.5)
+        # 锁3: 不让本阶段新增需要在阶段2处理的冗余。
+        lock3_ok = (r_new['RQ'] <= r_rq_limit + 1e-6)
 
         if lock2_ok and lock3_ok:
             # 通过锁，继续尝试更大
@@ -1121,7 +1179,7 @@ def run_stage_1_and_2(df_baseline, transit_dict, earliest_etd, target_eta,
     numeric_cols = (['本次总发货量']
                     + [ratio_col_name(r) for r in REGIONS]
                     + [f'{r}_在仓' for r in REGIONS]
-                    + ['M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)', 'M4预测(第4月)', 'M5预测(第5月)'])
+                    + FORECAST_COLS)
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(float)
@@ -1637,14 +1695,9 @@ def stage4_dead_redundancy_report(df, transit_dict, earliest_etd, target_eta,
         st = compute_row_status(row_dict, transit_dict, earliest_etd, target_eta,
                                 today, sales_cutoff, south_linkage)
         if st['RQ'] > 0.5:
-            forecasts = (
-                float(row_dict.get('M1预测(当月)', 0) or 0),
-                float(row_dict.get('M2预测(次月)', 0) or 0),
-                float(row_dict.get('M3预测(第3月)', 0) or 0),
-                float(row_dict.get('M4预测(第4月)', 0) or 0),
-                float(row_dict.get('M5预测(第5月)', 0) or 0),
-            )
-            avg_daily = max(sum(forecasts) / 150, 0.1)
+            forecasts = tuple(float(row_dict.get(col, 0) or 0)
+                              for col in FORECAST_COLS)
+            avg_daily = max(sum(forecasts) / (30 * len(FORECAST_COLS)), 0.1)
             dead_days = int(round(st['RQ'] / avg_daily))
             dead_records.append({
                 'SKU': row_dict.get('SKU', '-'),
@@ -1675,7 +1728,7 @@ def run_full_pipeline(df_baseline, transit_dict, earliest_etd, target_eta,
     numeric_cols = (['本次总发货量']
                     + [ratio_col_name(r) for r in REGIONS]
                     + [f'{r}_在仓' for r in REGIONS]
-                    + ['M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)', 'M4预测(第4月)', 'M5预测(第5月)'])
+                    + FORECAST_COLS)
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(float)
@@ -1796,7 +1849,7 @@ def generate_excel_template():
         '美东_多批次在途': ['', f'{(today + datetime.timedelta(days=8)).strftime("%Y-%m-%d")}:4000'],
         'GA_多批次在途': ['', ''], 'TX_多批次在途': ['', ''], 'CG_多批次在途': ['', ''],
         'M1预测(当月)': [1000, 1000], 'M2预测(次月)': [1000, 1000], 'M3预测(第3月)': [1000, 1000],
-        'M4预测(第4月)': [1000, 1000], 'M5预测(第5月)': [1000, 1000]
+        'M4预测(第4月)': [1000, 1000], 'M5预测(第5月)': [1000, 1000], 'M6预测(第6月)': [1000, 1000]
     }
     df_tpl = pd.DataFrame(template)
     output = io.BytesIO()
@@ -1839,6 +1892,11 @@ if uploaded_file is not None:
                 st.info(f"已自动探测表头位置（原文件第 {header_row_idx + 2} 行为表头）")
                 break
 
+    # 兼容旧版五个月模板：缺少的预测月份自动按 0 补齐。
+    for col in FORECAST_COLS:
+        if col not in df_input.columns:
+            df_input[col] = 0.0
+
     # 校验：必需列是否齐全
     required_cols = ['SKU', '店铺', '组别', '运营', '本次总发货量']
     missing = [c for c in required_cols if c not in df_input.columns]
@@ -1858,7 +1916,7 @@ else:
         '美东_多批次在途': ['', f'{(today + datetime.timedelta(days=8)).strftime("%Y-%m-%d")}:4000'],
         'GA_多批次在途': ['', ''], 'TX_多批次在途': ['', ''], 'CG_多批次在途': ['', ''],
         'M1预测(当月)': [1000, 1000], 'M2预测(次月)': [1000, 1000], 'M3预测(第3月)': [1000, 1000],
-        'M4预测(第4月)': [1000, 1000], 'M5预测(第5月)': [1000, 1000]
+        'M4预测(第4月)': [1000, 1000], 'M5预测(第5月)': [1000, 1000], 'M6预测(第6月)': [1000, 1000]
     })
 
 # ============================================================
@@ -1910,8 +1968,7 @@ if btn_recommend:
         rec_numeric_cols = (['本次总发货量']
                             + [ratio_col_name(r) for r in REGIONS]
                             + [f'{r}_在仓' for r in REGIONS]
-                            + ['M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)',
-                               'M4预测(第4月)', 'M5预测(第5月)'])
+                            + FORECAST_COLS)
         for col in rec_numeric_cols:
             if col in rec_df.columns:
                 rec_df[col] = pd.to_numeric(rec_df[col], errors='coerce').fillna(0.0).astype(float)
@@ -2104,8 +2161,7 @@ if btn_run:
         numeric_cols = (['本次总发货量']
                         + [ratio_col_name(r) for r in REGIONS]
                         + [f'{r}_在仓' for r in REGIONS]
-                        + ['M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)',
-                           'M4预测(第4月)', 'M5预测(第5月)'])
+                        + FORECAST_COLS)
         for col in numeric_cols:
             if col in working_df.columns:
                 working_df[col] = pd.to_numeric(working_df[col], errors='coerce').fillna(0.0).astype(float)

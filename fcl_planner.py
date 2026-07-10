@@ -19,6 +19,19 @@ FORECAST_COLS = [
     'M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)',
     'M4预测(第4月)', 'M5预测(第5月)', 'M6预测(第6月)'
 ]
+CONTRACT_SOURCE_COLS = {
+    'SKU': '产品编号',
+    '店铺': '店铺',
+    '运营': '运营专员',
+    '组别': '运营组别',
+    'PO号': '采购合同',
+    '合同可用数量': '可供应总数',
+    '交货日期': '出货日期',
+}
+CONTRACT_DERIVED_COLS = [
+    '本轮理论发货量', '本轮可用合同量', '本轮合同缺口',
+    '剩余合同数量', '推荐下单量', '最晚下单日', '备货状态'
+]
 
 
 # ============================================================
@@ -130,6 +143,512 @@ def round_preserve_sum(float_dict, target_sum):
 def row_to_key(row):
     """组别-运营/店铺 作为行唯一标识"""
     return f"{row.get('组别', '-')}-{row.get('运营', '-')}/{row.get('店铺', '-')}"
+
+
+def append_note(existing, note):
+    """追加备注，避免覆盖推荐发货量或合同校验已有提示。"""
+    existing = '' if pd.isna(existing) else str(existing).strip()
+    if not note:
+        return existing
+    if not existing:
+        return note
+    if note in existing:
+        return existing
+    return f"{existing}; {note}"
+
+
+def clean_text(val):
+    """把 Excel / dataframe 值转成用于匹配的干净文本。"""
+    if pd.isna(val):
+        return ''
+    return str(val).strip()
+
+
+def parse_date_value(val):
+    """兼容 Excel 日期、字符串日期与空值。"""
+    if pd.isna(val) or str(val).strip() == '':
+        return None
+    if isinstance(val, datetime.datetime):
+        return val.date()
+    if isinstance(val, datetime.date):
+        return val
+    parsed = pd.to_datetime(val, errors='coerce')
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def normalize_contract_qty(val):
+    qty = pd.to_numeric(pd.Series([val]), errors='coerce').fillna(0).iloc[0]
+    return max(0, int(round(float(qty))))
+
+
+def contract_match_key_from_values(sku, operator, shop, group):
+    return tuple(clean_text(v) for v in [sku, operator, shop, group])
+
+
+def contract_match_key_from_row(row):
+    return contract_match_key_from_values(
+        row.get('SKU', ''), row.get('运营', ''),
+        row.get('店铺', ''), row.get('组别', '')
+    )
+
+
+def contract_match_key_from_contract(contract):
+    return contract_match_key_from_values(
+        contract.get('SKU', ''), contract.get('运营', ''),
+        contract.get('店铺', ''), contract.get('组别', '')
+    )
+
+
+def load_contract_workbook(uploaded_contract_file):
+    """读取合同明细文件：Sheet1 合同明细，Sheet2 SPU交期。"""
+    contracts = []
+    lead_days_by_spu = {}
+    errors = []
+
+    if uploaded_contract_file is None:
+        errors.append({
+            'SKU': '-', 'SPU': '-', '组别': '-', '运营': '-', '店铺': '-',
+            '异常类型': '缺少合同文件',
+            '异常说明': '请上传包含合同明细和交期表的 Excel 文件'
+        })
+        return contracts, lead_days_by_spu, errors
+
+    try:
+        if hasattr(uploaded_contract_file, 'seek'):
+            uploaded_contract_file.seek(0)
+        xls = pd.ExcelFile(uploaded_contract_file)
+    except Exception as e:
+        errors.append({
+            'SKU': '-', 'SPU': '-', '组别': '-', '运营': '-', '店铺': '-',
+            '异常类型': '合同文件读取失败',
+            '异常说明': str(e)
+        })
+        return contracts, lead_days_by_spu, errors
+
+    if len(xls.sheet_names) < 2:
+        errors.append({
+            'SKU': '-', 'SPU': '-', '组别': '-', '运营': '-', '店铺': '-',
+            '异常类型': '缺少交期表',
+            '异常说明': '合同文件需包含 Sheet1 合同明细和 Sheet2 交期表'
+        })
+        return contracts, lead_days_by_spu, errors
+
+    try:
+        contract_df = pd.read_excel(xls, sheet_name=0)
+        lead_df = pd.read_excel(xls, sheet_name=1)
+    except Exception as e:
+        errors.append({
+            'SKU': '-', 'SPU': '-', '组别': '-', '运营': '-', '店铺': '-',
+            '异常类型': '合同文件解析失败',
+            '异常说明': str(e)
+        })
+        return contracts, lead_days_by_spu, errors
+
+    missing_contract_cols = [src for src in CONTRACT_SOURCE_COLS.values()
+                             if src not in contract_df.columns]
+    if missing_contract_cols:
+        errors.append({
+            'SKU': '-', 'SPU': '-', '组别': '-', '运营': '-', '店铺': '-',
+            '异常类型': '合同明细缺少字段',
+            '异常说明': f"缺少列: {', '.join(missing_contract_cols)}"
+        })
+
+    if 'SPU' not in lead_df.columns or '交期' not in lead_df.columns:
+        errors.append({
+            'SKU': '-', 'SPU': '-', '组别': '-', '运营': '-', '店铺': '-',
+            '异常类型': '交期表缺少字段',
+            '异常说明': 'Sheet2 必须包含 SPU、交期 两列表头'
+        })
+
+    if missing_contract_cols or 'SPU' not in lead_df.columns or '交期' not in lead_df.columns:
+        return contracts, lead_days_by_spu, errors
+
+    for row_idx, row in contract_df.iterrows():
+        sku = clean_text(row.get(CONTRACT_SOURCE_COLS['SKU']))
+        shop = clean_text(row.get(CONTRACT_SOURCE_COLS['店铺']))
+        operator = clean_text(row.get(CONTRACT_SOURCE_COLS['运营']))
+        group = clean_text(row.get(CONTRACT_SOURCE_COLS['组别']))
+        po = clean_text(row.get(CONTRACT_SOURCE_COLS['PO号']))
+        qty = normalize_contract_qty(row.get(CONTRACT_SOURCE_COLS['合同可用数量']))
+        delivery_date = parse_date_value(row.get(CONTRACT_SOURCE_COLS['交货日期']))
+
+        if not sku or not shop or not operator or not group:
+            errors.append({
+                'SKU': sku or '-', 'SPU': '-', '组别': group or '-',
+                '运营': operator or '-', '店铺': shop or '-',
+                '异常类型': '合同归属字段缺失',
+                '异常说明': f"合同明细第 {row_idx + 2} 行缺少 SKU/店铺/运营/组别"
+            })
+            continue
+        if qty <= 0:
+            continue
+        if delivery_date is None:
+            errors.append({
+                'SKU': sku, 'SPU': '-', '组别': group, '运营': operator, '店铺': shop,
+                '异常类型': '合同交货日期异常',
+                '异常说明': f"合同明细第 {row_idx + 2} 行出货日期为空或格式异常"
+            })
+            continue
+
+        contracts.append({
+            'SKU': sku,
+            '店铺': shop,
+            '运营': operator,
+            '组别': group,
+            'PO号': po or '-',
+            '合同可用数量': qty,
+            '交货日期': delivery_date,
+        })
+
+    for row_idx, row in lead_df.iterrows():
+        spu = clean_text(row.get('SPU'))
+        lead_days = pd.to_numeric(pd.Series([row.get('交期')]), errors='coerce').iloc[0]
+        if not spu:
+            continue
+        if pd.isna(lead_days) or float(lead_days) < 0:
+            errors.append({
+                'SKU': '-', 'SPU': spu, '组别': '-', '运营': '-', '店铺': '-',
+                '异常类型': '交期异常',
+                '异常说明': f"交期表第 {row_idx + 2} 行交期为空或非数字"
+            })
+            continue
+        lead_days_by_spu[spu] = int(round(float(lead_days)))
+
+    return contracts, lead_days_by_spu, errors
+
+
+def get_global_supply_events(row):
+    """合同备货只看全网总供应，不参与分区水池分配。"""
+    initial_stock = sum(float(row.get(f'{r}_在仓', 0) or 0) for r in REGIONS)
+    events = []
+    for r in REGIONS:
+        for dt, qty in parse_in_transit(row.get(f'{r}_多批次在途', '')).items():
+            if qty > 0:
+                events.append((dt, float(qty)))
+    return initial_stock, events
+
+
+def forecast_demand_between(row, today, start_date, end_date):
+    if end_date < start_date:
+        return 0.0
+    daily_sales = build_daily_sales_fn(row, today)
+    total = 0.0
+    d_obj = start_date
+    while d_obj <= end_date:
+        total += daily_sales(d_obj)
+        d_obj += datetime.timedelta(days=1)
+    return total
+
+
+def simulate_global_stock(row, initial_stock, arrival_events, today, until=None, max_days=2200):
+    """全网日粒度库存推演，返回首次补货需求日和最终耗尽日。"""
+    daily_sales = build_daily_sales_fn(row, today)
+    stock = float(initial_stock)
+    events_by_date = {}
+    for dt, qty in arrival_events:
+        if qty > 0:
+            events_by_date[dt] = events_by_date.get(dt, 0.0) + float(qty)
+
+    last_event_date = max(events_by_date.keys(), default=today)
+    sim_until = until or today + datetime.timedelta(days=max_days)
+    sim_until = max(sim_until, last_event_date + datetime.timedelta(days=1))
+
+    first_need_date = None
+    final_oos_date = None
+    d_obj = today + datetime.timedelta(days=1)
+    while d_obj <= sim_until:
+        stock += events_by_date.get(d_obj, 0.0)
+        demand = daily_sales(d_obj)
+        if stock + 1e-9 >= demand:
+            stock -= demand
+        else:
+            if first_need_date is None:
+                first_need_date = d_obj
+            if d_obj >= last_event_date and final_oos_date is None:
+                final_oos_date = d_obj
+            stock = 0.0
+
+        if until is None and final_oos_date is not None and d_obj > last_event_date:
+            break
+        d_obj += datetime.timedelta(days=1)
+
+    return {
+        'first_need_date': first_need_date,
+        'final_oos_date': final_oos_date,
+        'stock_at_end': max(0.0, stock),
+    }
+
+
+def deduct_current_contracts(row, row_contracts, theoretical_qty, earliest_etd):
+    """本轮发货只扣交货日期不晚于最早可发货日的合同，FIFO + PO排序。"""
+    need = max(0, int(round(float(theoretical_qty or 0))))
+    eligible = [copy.deepcopy(c) for c in row_contracts
+                if c['交货日期'] <= earliest_etd and c['合同可用数量'] > 0]
+    future = [copy.deepcopy(c) for c in row_contracts
+              if c['交货日期'] > earliest_etd and c['合同可用数量'] > 0]
+    eligible.sort(key=lambda c: (c['交货日期'], c['PO号']))
+    future.sort(key=lambda c: (c['交货日期'], c['PO号']))
+
+    eligible_total = sum(c['合同可用数量'] for c in eligible)
+    details = []
+    remaining_contracts = future[:]
+    deducted = 0
+
+    for seq, contract in enumerate(eligible, 1):
+        use_qty = min(need, contract['合同可用数量'])
+        deducted += use_qty
+        need -= use_qty
+        remain_qty = contract['合同可用数量'] - use_qty
+        details.append({
+            'SKU': contract['SKU'],
+            '组别': contract['组别'],
+            '运营': contract['运营'],
+            '店铺': contract['店铺'],
+            'PO号': contract['PO号'],
+            '合同交货日期': contract['交货日期'].strftime('%Y-%m-%d'),
+            '合同原可用数量': contract['合同可用数量'],
+            '本轮扣减数量': use_qty,
+            '扣减后剩余数量': remain_qty,
+            '扣减顺序': seq,
+            '备注': '' if use_qty > 0 else '本轮理论发货已满足，未扣减',
+        })
+        if remain_qty > 0:
+            remaining = copy.deepcopy(contract)
+            remaining['合同可用数量'] = remain_qty
+            remaining_contracts.append(remaining)
+        if need <= 0:
+            remaining_contracts.extend(copy.deepcopy(c) for c in eligible[seq:])
+            break
+
+    remaining_contracts.sort(key=lambda c: (c['交货日期'], c['PO号']))
+    shortage = max(0, max(0, int(round(float(theoretical_qty or 0)))) - deducted)
+    return {
+        '本轮可用合同量': eligible_total,
+        '本轮实际发货量': deducted,
+        '本轮合同缺口': shortage,
+        '剩余合同': remaining_contracts,
+        '扣减明细': details,
+    }
+
+
+def contract_plan_qty(row, today, need_date, next_arrival_date, sales_cycle_days):
+    if next_arrival_date and next_arrival_date > need_date:
+        end_date = next_arrival_date - datetime.timedelta(days=1)
+    else:
+        end_date = need_date + datetime.timedelta(days=max(0, int(sales_cycle_days) - 1))
+    return max(0, int(math.ceil(forecast_demand_between(row, today, need_date, end_date))))
+
+
+def schedule_remaining_contracts(row, remaining_contracts, initial_stock, base_events,
+                                 today, earliest_etd, ocean_cycle_days, sales_cycle_days):
+    """剩余合同允许拆分 PO，按需求日倒推建议发货日。"""
+    pool = [copy.deepcopy(c) for c in remaining_contracts if c['合同可用数量'] > 0]
+    pool.sort(key=lambda c: (c['交货日期'], c['PO号']))
+    scheduled_events = list(base_events)
+    plan_records = []
+    first_need_date = None
+    first_uncovered_gap = None
+    seq = 1
+    loop_guard = 0
+
+    while pool and loop_guard < 2000:
+        loop_guard += 1
+        sim = simulate_global_stock(row, initial_stock, scheduled_events, today)
+        raw_first_need = sim['first_need_date']
+        if raw_first_need and first_need_date is None:
+            first_need_date = raw_first_need
+
+        # 先处理首个补货需求日，避免“先断货、后续在途接上”的空窗被最终耗尽日掩盖。
+        if raw_first_need and first_uncovered_gap is None:
+            need_date = raw_first_need
+        else:
+            need_date = sim['final_oos_date'] or raw_first_need
+        if need_date is None:
+            for contract in pool:
+                plan_records.append({
+                    'SKU': contract['SKU'],
+                    'SPU': clean_text(row.get('SPU', '-')) or '-',
+                    '组别': contract['组别'],
+                    '运营': contract['运营'],
+                    '店铺': contract['店铺'],
+                    'PO号': contract['PO号'],
+                    '合同交货日期': contract['交货日期'].strftime('%Y-%m-%d'),
+                    '可用剩余数量': contract['合同可用数量'],
+                    '本次计划发货数量': 0,
+                    '发货后PO剩余': contract['合同可用数量'],
+                    '建议合同发货日': '-',
+                    '预计到美日': '-',
+                    '是否延后发货': '-',
+                    '延后原因': '无销售预测或无需发货',
+                    '是否覆盖缺口': '-',
+                })
+            break
+
+        contract = pool.pop(0)
+        latest_ship_date = need_date - datetime.timedelta(days=int(ocean_cycle_days))
+        available_ship_date = max(contract['交货日期'], earliest_etd)
+        ship_date = max(available_ship_date, latest_ship_date)
+        arrival_date = ship_date + datetime.timedelta(days=int(ocean_cycle_days))
+        next_arrival = pool[0]['交货日期'] + datetime.timedelta(days=int(ocean_cycle_days)) if pool else None
+        need_qty = contract_plan_qty(row, today, need_date, next_arrival, sales_cycle_days)
+        ship_qty = min(contract['合同可用数量'], max(1, need_qty))
+        remain_qty = contract['合同可用数量'] - ship_qty
+        covers_gap = arrival_date <= need_date
+        if not covers_gap and first_uncovered_gap is None:
+            first_uncovered_gap = need_date
+
+        scheduled_events.append((arrival_date, ship_qty))
+        plan_records.append({
+            'SKU': contract['SKU'],
+            'SPU': clean_text(row.get('SPU', '-')) or '-',
+            '组别': contract['组别'],
+            '运营': contract['运营'],
+            '店铺': contract['店铺'],
+            'PO号': contract['PO号'],
+            '合同交货日期': contract['交货日期'].strftime('%Y-%m-%d'),
+            '可用剩余数量': contract['合同可用数量'],
+            '本次计划发货数量': ship_qty,
+            '发货后PO剩余': remain_qty,
+            '建议合同发货日': ship_date.strftime('%Y-%m-%d'),
+            '预计到美日': arrival_date.strftime('%Y-%m-%d'),
+            '是否延后发货': '是' if ship_date > contract['交货日期'] else '否',
+            '延后原因': '海外库存充足，延后发货' if ship_date > contract['交货日期'] else '',
+            '是否覆盖缺口': '是' if covers_gap else '否，合同交货偏晚会产生空窗',
+        })
+
+        if remain_qty > 0:
+            remaining = copy.deepcopy(contract)
+            remaining['合同可用数量'] = remain_qty
+            pool.insert(0, remaining)
+
+    if loop_guard >= 2000:
+        plan_records.append({
+            'SKU': clean_text(row.get('SKU', '-')) or '-',
+            'SPU': clean_text(row.get('SPU', '-')) or '-',
+            '组别': clean_text(row.get('组别', '-')) or '-',
+            '运营': clean_text(row.get('运营', '-')) or '-',
+            '店铺': clean_text(row.get('店铺', '-')) or '-',
+            'PO号': '-',
+            '合同交货日期': '-',
+            '可用剩余数量': 0,
+            '本次计划发货数量': 0,
+            '发货后PO剩余': 0,
+            '建议合同发货日': '-',
+            '预计到美日': '-',
+            '是否延后发货': '-',
+            '延后原因': '剩余合同拆分次数超过上限，请检查数据',
+            '是否覆盖缺口': '-',
+        })
+
+    return scheduled_events, plan_records, {
+        '首次补货需求日': first_need_date,
+        '首个未覆盖空窗日': first_uncovered_gap,
+    }
+
+
+def compute_contract_recommendation(row, contracts, lead_days_by_spu, theoretical_qty,
+                                    today, earliest_etd, target_eta,
+                                    ocean_cycle_days, sales_cycle_days):
+    row_key = contract_match_key_from_row(row)
+    row_contracts = [c for c in contracts if contract_match_key_from_contract(c) == row_key]
+    deduction = deduct_current_contracts(row, row_contracts, theoretical_qty, earliest_etd)
+    initial_stock, current_events = get_global_supply_events(row)
+    base_events = list(current_events)
+    if deduction['本轮实际发货量'] > 0:
+        base_events.append((target_eta, deduction['本轮实际发货量']))
+
+    spu = clean_text(row.get('SPU'))
+    lead_days = lead_days_by_spu.get(spu)
+    exception_records = []
+    remarks = []
+
+    if theoretical_qty > 0 and not row_contracts:
+        remarks.append('未匹配到合同明细')
+        exception_records.append({
+            'SKU': row.get('SKU', '-'), 'SPU': spu or '-',
+            '组别': row.get('组别', '-'), '运营': row.get('运营', '-'), '店铺': row.get('店铺', '-'),
+            '异常类型': '缺少合同',
+            '异常说明': '未匹配到 SKU+运营+店铺+组别 对应的合同明细'
+        })
+    if deduction['本轮合同缺口'] > 0:
+        remarks.append(f"理论发货{int(round(theoretical_qty))}，合同数量不足")
+    if not spu or lead_days is None:
+        exception_records.append({
+            'SKU': row.get('SKU', '-'), 'SPU': spu or '-',
+            '组别': row.get('组别', '-'), '运营': row.get('运营', '-'), '店铺': row.get('店铺', '-'),
+            '异常类型': '缺少交期',
+            '异常说明': '销售预测源表缺少 SPU，或交期表未匹配到该 SPU'
+        })
+        return {
+            '本轮实际发货量': deduction['本轮实际发货量'],
+            '本轮可用合同量': deduction['本轮可用合同量'],
+            '本轮合同缺口': deduction['本轮合同缺口'],
+            '剩余合同数量': sum(c['合同可用数量'] for c in deduction['剩余合同']),
+            '推荐下单量': '-',
+            '最晚下单日': '-',
+            '备货状态': '缺少交期',
+            '备注': '; '.join(remarks),
+            '合同扣减明细': deduction['扣减明细'],
+            '剩余合同发货计划': [],
+            '异常记录': exception_records,
+            '_首次补货需求日': None,
+            '_首个未覆盖空窗日': None,
+            '_含剩余合同预估耗尽日': None,
+        }
+
+    scheduled_events, plan_records, hidden = schedule_remaining_contracts(
+        row, deduction['剩余合同'], initial_stock, base_events,
+        today, earliest_etd, int(ocean_cycle_days), int(sales_cycle_days)
+    )
+
+    coverage_days = int(lead_days) + int(ocean_cycle_days) + int(sales_cycle_days)
+    coverage_cutoff = today + datetime.timedelta(days=coverage_days)
+    demand_to_cutoff = forecast_demand_between(
+        row, today, today + datetime.timedelta(days=1), coverage_cutoff
+    )
+    supply_to_cutoff = initial_stock + sum(qty for dt, qty in scheduled_events
+                                           if dt <= coverage_cutoff)
+    recommend_order_qty = max(0, int(math.ceil(demand_to_cutoff - supply_to_cutoff)))
+
+    final_sim = simulate_global_stock(row, initial_stock, scheduled_events, today)
+    final_oos = final_sim['final_oos_date']
+    latest_order_date = (final_oos - datetime.timedelta(days=int(lead_days) + int(ocean_cycle_days))
+                         if final_oos else None)
+
+    if hidden['首个未覆盖空窗日'] is not None:
+        remarks.append('部分剩余合同到美晚于补货需求日，详见剩余合同发货计划')
+
+    if deduction['本轮合同缺口'] > 0:
+        status = '合同不足'
+    elif not row_contracts and theoretical_qty > 0:
+        status = '缺少合同'
+    elif hidden['首个未覆盖空窗日'] is not None:
+        status = '存在库存空窗'
+    elif recommend_order_qty > 0 and latest_order_date and latest_order_date < today:
+        status = '已逾期'
+    elif recommend_order_qty > 0:
+        status = '建议下单'
+    else:
+        status = '覆盖期内无需下单'
+
+    return {
+        '本轮实际发货量': deduction['本轮实际发货量'],
+        '本轮可用合同量': deduction['本轮可用合同量'],
+        '本轮合同缺口': deduction['本轮合同缺口'],
+        '剩余合同数量': sum(c['合同可用数量'] for c in deduction['剩余合同']),
+        '推荐下单量': recommend_order_qty,
+        '最晚下单日': latest_order_date.strftime('%Y-%m-%d') if latest_order_date else '-',
+        '备货状态': status,
+        '备注': '; '.join(remarks),
+        '合同扣减明细': deduction['扣减明细'],
+        '剩余合同发货计划': plan_records,
+        '异常记录': exception_records,
+        '_首次补货需求日': hidden['首次补货需求日'],
+        '_首个未覆盖空窗日': hidden['首个未覆盖空窗日'],
+        '_含剩余合同预估耗尽日': final_oos,
+    }
 
 
 # ============================================================
@@ -1832,6 +2351,18 @@ with st.sidebar:
     if d_diff_invalid:
         st.error(f"极速熔断：D差 ({d_diff}天) 小于最短海运时效 ({min(transit_times.values())}天)！")
 
+    st.markdown("---")
+    st.subheader("📦 合同备发货参数")
+    default_ocean_cycle = int(round(sum(transit_times[r] for r in ['美西', '美东', 'GA', 'TX']) / 4))
+    contract_ocean_cycle_days = st.number_input(
+        "合同海运周期（天）", min_value=0, value=default_ocean_cycle, step=1,
+        help="用于剩余合同到美日、推荐下单量和最晚下单日；不改变上方分仓海运时效。"
+    )
+    contract_sales_cycle_days = st.number_input(
+        "销售周期（天）", min_value=0, value=30, step=1,
+        help="用于后续推荐下单量覆盖窗口，不加安全缓冲。"
+    )
+
 # ============================================================
 # 数据上传与编辑
 # ============================================================
@@ -1841,6 +2372,7 @@ st.header("📥 2. 上传/输入业务数据")
 def generate_excel_template():
     template = {
         'SKU': ['SKU-A', 'SKU-A'],
+        'SPU': ['SPU-A', 'SPU-A'],
         '店铺': ['Shop-A', 'Shop-B'], '组别': ['二部', '三部'], '运营': ['张三', '李四'],
         '本次总发货量': [1000, 1000],
         '理论_西%': [25, 25], '理论_东%': [25, 25], '理论_GA%': [25, 25], '理论_TX%': [25, 25], '理论_CG%': [0, 0],
@@ -1908,6 +2440,7 @@ else:
     # 默认示例：张三-李四经典互补场景
     df_input = pd.DataFrame({
         'SKU': ['SKU-A', 'SKU-A'],
+        'SPU': ['SPU-A', 'SPU-A'],
         '店铺': ['Shop-A', 'Shop-B'], '组别': ['二部', '三部'], '运营': ['张三', '李四'],
         '本次总发货量': [1000, 1000],
         '理论_西%': [25, 25], '理论_东%': [25, 25], '理论_GA%': [25, 25], '理论_TX%': [25, 25], '理论_CG%': [0, 0],
@@ -1935,34 +2468,59 @@ if rec_msgs:
         parts.append(f"{rec_msgs['small_count']} 行需求 1-9 pcs 已归零(如需发货请手动改为 ≥10)")
     if rec_msgs.get('redundant_count'):
         parts.append(f"{rec_msgs['redundant_count']} 行库存已冗余(推荐 0)")
+    if rec_msgs.get('contract_short_count'):
+        parts.append(f"{rec_msgs['contract_short_count']} 行合同数量不足")
+    if rec_msgs.get('gap_count'):
+        parts.append(f"{rec_msgs['gap_count']} 行存在库存空窗")
+    if rec_msgs.get('missing_contract_count'):
+        parts.append(f"{rec_msgs['missing_contract_count']} 行未匹配到合同")
+    if rec_msgs.get('missing_lead_count'):
+        parts.append(f"{rec_msgs['missing_lead_count']} 行缺少 SPU 交期")
     if parts:
         st.warning("⚠️ " + "; ".join(parts) + "。明细见表格「备注」列。")
 
 edited_df = st.data_editor(df_input, num_rows="dynamic", use_container_width=True,
                            key=f"main_editor_v{st.session_state.get('rec_version', 0)}")
 
+contract_file = st.file_uploader(
+    "⬆️ 上传合同明细 + SPU交期 Excel（Sheet1 合同明细，Sheet2 交期表）",
+    type=["xlsx"], key="contract_workbook"
+)
+
 # ============================================================
-# V3.7a: 生成推荐发货量按钮
+# V3.7b: 生成推荐备发货量按钮
 # ============================================================
 col_rec1, col_rec2 = st.columns([1, 3])
 with col_rec1:
     btn_recommend = st.button(
-        "🧮 生成推荐发货量", type="secondary",
-        help="基于在仓+在途+销售预测, 反推「刚好在销售截止日售罄」的发货量, "
-             "结果写入上方表格的「本次总发货量」列, 可手动修改后再运算。"
-             "如需安全库存, 请将侧边栏的销售截止日相应后移。"
+        "📦 生成推荐备发货量", type="secondary",
+        help="基于销售预测、在仓在途、本轮排期、合同明细和 SPU 交期，"
+             "生成本轮推荐发货量、合同扣减、后续推荐下单量和最晚下单日。"
     )
 with col_rec2:
-    st.caption("推荐目标: 销售截止日当天剩余库存 ≈ 0。生成后可在表格中逐行检查、修改, 再点「开始逆向推演运算」。")
+    st.caption("生成后会回写「本次总发货量」为合同约束后的本轮实际发货量；可人工检查、修改后再点「开始逆向推演运算」。")
 
 if btn_recommend:
     if d_diff_invalid:
-        st.error("D差小于最短海运时效, 无法计算推荐发货量!")
+        st.error("D差小于最短海运时效, 无法计算推荐备发货量!")
+    elif contract_file is None:
+        st.error("请先上传合同明细 + SPU交期 Excel。")
     else:
+        contract_rows, lead_days_by_spu, load_errors = load_contract_workbook(contract_file)
+        fatal_types = {
+            '缺少合同文件', '合同文件读取失败', '合同文件解析失败',
+            '缺少交期表', '合同明细缺少字段', '交期表缺少字段'
+        }
+        fatal_errors = [e for e in load_errors if e.get('异常类型') in fatal_types]
+        if fatal_errors:
+            st.error("合同文件格式校验失败，请先修正后再生成推荐备发货量。")
+            st.dataframe(pd.DataFrame(fatal_errors), use_container_width=True)
+            st.stop()
+
         rec_df = edited_df.copy()
-        # 重复生成时, 先移除旧备注列
-        if '备注' in rec_df.columns:
-            rec_df = rec_df.drop(columns=['备注'])
+        drop_cols = [c for c in (CONTRACT_DERIVED_COLS + ['备注']) if c in rec_df.columns]
+        if drop_cols:
+            rec_df = rec_df.drop(columns=drop_cols)
 
         # 数值规范化(与主运算同口径)
         rec_numeric_cols = (['本次总发货量']
@@ -1975,6 +2533,8 @@ if btn_recommend:
         for col in ['SKU', '店铺', '组别', '运营']:
             if col in rec_df.columns:
                 rec_df[col] = rec_df[col].fillna('-').astype(str)
+        if 'SPU' in rec_df.columns:
+            rec_df['SPU'] = rec_df['SPU'].fillna('').astype(str)
 
         # 校验理论占比和 = 100
         rec_errors = []
@@ -1987,30 +2547,67 @@ if btn_recommend:
             st.warning("\n".join(rec_errors))
         else:
             n_rows = len(rec_df)
-            prog = st.progress(0, text=f"正在计算推荐发货量... 0/{n_rows}")
+            prog = st.progress(0, text=f"正在计算推荐备发货量... 0/{n_rows}")
             notes = []
+            derived_values = {col: [] for col in CONTRACT_DERIVED_COLS}
+            deduct_records = []
+            plan_records = []
+            exception_records = list(load_errors)
             small_count = 0
             redundant_count = 0
+            contract_short_count = 0
+            gap_count = 0
+            missing_contract_count = 0
+            missing_lead_count = 0
             for i, (idx, row) in enumerate(rec_df.iterrows()):
                 q_final, q_raw, status = recommend_q_ship(
                     row.to_dict(), transit_times, earliest_etd, target_eta,
                     today, sales_cutoff, False
                 )
-                rec_df.at[idx, '本次总发货量'] = float(q_final)
+                note = ''
                 if status == 'small':
-                    notes.append(f"需求{q_raw}pcs已归零")
+                    note = f"需求{q_raw}pcs已归零"
                     small_count += 1
                 elif status == 'redundant':
-                    notes.append("库存已冗余")
+                    note = "库存已冗余"
                     redundant_count += 1
-                else:
-                    notes.append("")
+
+                contract_result = compute_contract_recommendation(
+                    row.to_dict(), contract_rows, lead_days_by_spu, q_final,
+                    today, earliest_etd, target_eta,
+                    contract_ocean_cycle_days, contract_sales_cycle_days
+                )
+                rec_df.at[idx, '本次总发货量'] = float(contract_result['本轮实际发货量'])
+
+                derived_values['本轮理论发货量'].append(int(round(q_final)))
+                for col in CONTRACT_DERIVED_COLS:
+                    if col != '本轮理论发货量':
+                        derived_values[col].append(contract_result[col])
+
+                note = append_note(note, contract_result.get('备注', ''))
+                notes.append(note)
+                deduct_records.extend(contract_result.get('合同扣减明细', []))
+                plan_records.extend(contract_result.get('剩余合同发货计划', []))
+                exception_records.extend(contract_result.get('异常记录', []))
+
+                if contract_result['本轮合同缺口'] > 0:
+                    contract_short_count += 1
+                if contract_result['备货状态'] == '存在库存空窗':
+                    gap_count += 1
+                if contract_result['备货状态'] == '缺少合同':
+                    missing_contract_count += 1
+                if contract_result['备货状态'] == '缺少交期':
+                    missing_lead_count += 1
+
                 prog.progress((i + 1) / n_rows,
-                              text=f"正在计算推荐发货量... {i + 1}/{n_rows}")
+                              text=f"正在计算推荐备发货量... {i + 1}/{n_rows}")
             prog.empty()
 
-            # 备注列插入「本次总发货量」之后(即与理论_西% 之间)
+            # 派生列插入「本次总发货量」之后，保持后续主运算仍读取本次总发货量。
             insert_pos = rec_df.columns.get_loc('本次总发货量') + 1
+            for col in CONTRACT_DERIVED_COLS:
+                rec_df.insert(insert_pos, col, derived_values[col])
+                insert_pos += 1
             rec_df.insert(insert_pos, '备注', notes)
 
             st.session_state['recommended_df'] = rec_df
@@ -2018,8 +2615,40 @@ if btn_recommend:
             st.session_state['recommend_msgs'] = {
                 'small_count': small_count,
                 'redundant_count': redundant_count,
+                'contract_short_count': contract_short_count,
+                'gap_count': gap_count,
+                'missing_contract_count': missing_contract_count,
+                'missing_lead_count': missing_lead_count,
+            }
+            st.session_state['contract_stocking_detail'] = {
+                'deduct_records': deduct_records,
+                'plan_records': plan_records,
+                'exception_records': exception_records,
             }
             st.rerun()
+
+detail = st.session_state.get('contract_stocking_detail')
+if detail:
+    st.markdown("#### 📦 合同备发货测算明细")
+    tab_deduct, tab_plan, tab_errors = st.tabs(["合同扣减明细", "剩余合同发货计划", "异常检查"])
+    with tab_deduct:
+        records = detail.get('deduct_records', [])
+        if records:
+            st.dataframe(pd.DataFrame(records), use_container_width=True)
+        else:
+            st.info("无本轮合同扣减记录。")
+    with tab_plan:
+        records = detail.get('plan_records', [])
+        if records:
+            st.dataframe(pd.DataFrame(records), use_container_width=True)
+        else:
+            st.info("无剩余合同发货计划。")
+    with tab_errors:
+        records = detail.get('exception_records', [])
+        if records:
+            st.dataframe(pd.DataFrame(records), use_container_width=True)
+        else:
+            st.success("未发现合同/交期异常。")
 
 
 # ============================================================
@@ -2031,7 +2660,6 @@ def compute_main_board(df, transit_dict, earliest_etd, target_eta, today, sales_
     输出：每行的主看板指标
     """
     results = []
-    sales_window = (sales_cutoff - today).days
 
     for _, row in df.iterrows():
         row_dict = row.to_dict()
@@ -2152,12 +2780,6 @@ if btn_run:
         # 数据规范化
         working_df = edited_df.copy()
 
-        # V3.7a: 提取并剔除「备注」列(算法引擎不使用; 仅 S0 主看板回显)
-        row_notes = None
-        if '备注' in working_df.columns:
-            row_notes = working_df['备注'].fillna('').astype(str).tolist()
-            working_df = working_df.drop(columns=['备注'])
-
         numeric_cols = (['本次总发货量']
                         + [ratio_col_name(r) for r in REGIONS]
                         + [f'{r}_在仓' for r in REGIONS]
@@ -2168,6 +2790,12 @@ if btn_run:
         for col in ['SKU', '店铺', '组别', '运营']:
             if col in working_df.columns:
                 working_df[col] = working_df[col].fillna('-').astype(str)
+
+        # V3.7a: 提取并剔除「备注」列(算法引擎不使用; 仅 S0 主看板回显)
+        row_notes = None
+        if '备注' in working_df.columns:
+            row_notes = working_df['备注'].fillna('').astype(str).tolist()
+            working_df = working_df.drop(columns=['备注'])
 
         # 同组别同SKU 汇总计算（启用调拨时不允许聚合）
         if agg_on and not transfer_on:

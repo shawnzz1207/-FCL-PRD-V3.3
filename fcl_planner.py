@@ -32,6 +32,7 @@ CONTRACT_DERIVED_COLS = [
     '本轮理论发货量', '本轮可用合同量', '本轮合同缺口',
     '剩余合同数量', '推荐下单量', '最晚下单日', '备货状态'
 ]
+DEFAULT_LEAD_DAYS = 60
 
 
 # ============================================================
@@ -330,10 +331,10 @@ def get_global_supply_events(row):
     return initial_stock, events
 
 
-def forecast_demand_between(row, today, start_date, end_date):
+def forecast_demand_between(row, today, start_date, end_date, daily_sales_fn=None):
     if end_date < start_date:
         return 0.0
-    daily_sales = build_daily_sales_fn(row, today)
+    daily_sales = daily_sales_fn or build_daily_sales_fn(row, today)
     total = 0.0
     d_obj = start_date
     while d_obj <= end_date:
@@ -342,9 +343,10 @@ def forecast_demand_between(row, today, start_date, end_date):
     return total
 
 
-def simulate_global_stock(row, initial_stock, arrival_events, today, until=None, max_days=2200):
+def simulate_global_stock(row, initial_stock, arrival_events, today, until=None, max_days=2200,
+                          daily_sales_fn=None):
     """全网日粒度库存推演，返回首次补货需求日和最终耗尽日。"""
-    daily_sales = build_daily_sales_fn(row, today)
+    daily_sales = daily_sales_fn or build_daily_sales_fn(row, today)
     stock = float(initial_stock)
     events_by_date = {}
     for dt, qty in arrival_events:
@@ -433,17 +435,23 @@ def deduct_current_contracts(row, row_contracts, theoretical_qty, earliest_etd):
     }
 
 
-def contract_plan_qty(row, today, need_date, next_arrival_date, sales_cycle_days):
+def contract_plan_qty(row, today, need_date, next_arrival_date, sales_cycle_days,
+                      daily_sales_fn=None):
     if next_arrival_date and next_arrival_date > need_date:
         end_date = next_arrival_date - datetime.timedelta(days=1)
     else:
         end_date = need_date + datetime.timedelta(days=max(0, int(sales_cycle_days) - 1))
-    return max(0, int(math.ceil(forecast_demand_between(row, today, need_date, end_date))))
+    daily_sales_fn = daily_sales_fn or build_contract_daily_sales_fn(row, today)
+    return max(0, int(math.ceil(forecast_demand_between(
+        row, today, need_date, end_date, daily_sales_fn=daily_sales_fn
+    ))))
 
 
 def schedule_remaining_contracts(row, remaining_contracts, initial_stock, base_events,
-                                 today, earliest_etd, ocean_cycle_days, sales_cycle_days):
+                                 today, earliest_etd, ocean_cycle_days, sales_cycle_days,
+                                 daily_sales_fn=None):
     """剩余合同允许拆分 PO，按需求日倒推建议发货日。"""
+    daily_sales_fn = daily_sales_fn or build_contract_daily_sales_fn(row, today)
     pool = [copy.deepcopy(c) for c in remaining_contracts if c['合同可用数量'] > 0]
     pool.sort(key=lambda c: (c['交货日期'], c['PO号']))
     scheduled_events = list(base_events)
@@ -455,7 +463,9 @@ def schedule_remaining_contracts(row, remaining_contracts, initial_stock, base_e
 
     while pool and loop_guard < 2000:
         loop_guard += 1
-        sim = simulate_global_stock(row, initial_stock, scheduled_events, today)
+        sim = simulate_global_stock(
+            row, initial_stock, scheduled_events, today, daily_sales_fn=daily_sales_fn
+        )
         raw_first_need = sim['first_need_date']
         if raw_first_need and first_need_date is None:
             first_need_date = raw_first_need
@@ -492,7 +502,10 @@ def schedule_remaining_contracts(row, remaining_contracts, initial_stock, base_e
         ship_date = max(available_ship_date, latest_ship_date)
         arrival_date = ship_date + datetime.timedelta(days=int(ocean_cycle_days))
         next_arrival = pool[0]['交货日期'] + datetime.timedelta(days=int(ocean_cycle_days)) if pool else None
-        need_qty = contract_plan_qty(row, today, need_date, next_arrival, sales_cycle_days)
+        need_qty = contract_plan_qty(
+            row, today, need_date, next_arrival, sales_cycle_days,
+            daily_sales_fn=daily_sales_fn
+        )
         ship_qty = min(contract['合同可用数量'], max(1, need_qty))
         remain_qty = contract['合同可用数量'] - ship_qty
         covers_gap = arrival_date <= need_date
@@ -575,47 +588,61 @@ def compute_contract_recommendation(row, contracts, lead_days_by_spu, theoretica
     if deduction['本轮合同缺口'] > 0:
         remarks.append(f"理论发货{int(round(theoretical_qty))}，合同数量不足")
     if not spu or lead_days is None:
-        exception_records.append({
-            'SKU': row.get('SKU', '-'), 'SPU': spu or '-',
-            '组别': row.get('组别', '-'), '运营': row.get('运营', '-'), '店铺': row.get('店铺', '-'),
-            '异常类型': '缺少交期',
-            '异常说明': '销售预测源表缺少 SPU，或交期表未匹配到该 SPU'
-        })
-        return {
-            '本轮实际发货量': deduction['本轮实际发货量'],
-            '本轮可用合同量': deduction['本轮可用合同量'],
-            '本轮合同缺口': deduction['本轮合同缺口'],
-            '剩余合同数量': sum(c['合同可用数量'] for c in deduction['剩余合同']),
-            '推荐下单量': '-',
-            '最晚下单日': '-',
-            '备货状态': '缺少交期',
-            '备注': '; '.join(remarks),
-            '合同扣减明细': deduction['扣减明细'],
-            '剩余合同发货计划': [],
-            '异常记录': exception_records,
-            '_首次补货需求日': None,
-            '_首个未覆盖空窗日': None,
-            '_含剩余合同预估耗尽日': None,
-        }
+        lead_days = DEFAULT_LEAD_DAYS
+        remarks.append(f'默认{DEFAULT_LEAD_DAYS}天交期')
 
+    contract_daily_sales_fn = build_contract_daily_sales_fn(row, today)
     scheduled_events, plan_records, hidden = schedule_remaining_contracts(
         row, deduction['剩余合同'], initial_stock, base_events,
-        today, earliest_etd, int(ocean_cycle_days), int(sales_cycle_days)
+        today, earliest_etd, int(ocean_cycle_days), int(sales_cycle_days),
+        daily_sales_fn=contract_daily_sales_fn
     )
 
     coverage_days = int(lead_days) + int(ocean_cycle_days) + int(sales_cycle_days)
     coverage_cutoff = today + datetime.timedelta(days=coverage_days)
     demand_to_cutoff = forecast_demand_between(
-        row, today, today + datetime.timedelta(days=1), coverage_cutoff
+        row, today, today + datetime.timedelta(days=1), coverage_cutoff,
+        daily_sales_fn=contract_daily_sales_fn
     )
     supply_to_cutoff = initial_stock + sum(qty for dt, qty in scheduled_events
                                            if dt <= coverage_cutoff)
     recommend_order_qty = max(0, int(math.ceil(demand_to_cutoff - supply_to_cutoff)))
 
-    final_sim = simulate_global_stock(row, initial_stock, scheduled_events, today)
+    final_sim = simulate_global_stock(
+        row, initial_stock, scheduled_events, today,
+        daily_sales_fn=contract_daily_sales_fn
+    )
     final_oos = final_sim['final_oos_date']
     latest_order_date = (final_oos - datetime.timedelta(days=int(lead_days) + int(ocean_cycle_days))
                          if final_oos else None)
+
+    # 历史最晚下单日无法再覆盖此前需求，只保留当前订单可正常到美后的销售周期需求。
+    if latest_order_date and latest_order_date < today:
+        current_order_arrival = today + datetime.timedelta(
+            days=int(lead_days) + int(ocean_cycle_days)
+        )
+        current_order_cutoff = current_order_arrival + datetime.timedelta(
+            days=max(0, int(sales_cycle_days) - 1)
+        )
+        before_arrival = simulate_global_stock(
+            row, initial_stock, scheduled_events, today,
+            until=current_order_arrival - datetime.timedelta(days=1),
+            daily_sales_fn=contract_daily_sales_fn
+        )
+        supply_after_arrival = before_arrival['stock_at_end'] + sum(
+            qty for dt, qty in scheduled_events
+            if current_order_arrival <= dt <= current_order_cutoff
+        )
+        demand_after_arrival = forecast_demand_between(
+            row, today, current_order_arrival, current_order_cutoff,
+            daily_sales_fn=contract_daily_sales_fn
+        )
+        recommend_order_qty = max(0, int(math.ceil(demand_after_arrival - supply_after_arrival)))
+        latest_order_date = None
+
+    if 0 < recommend_order_qty < 10:
+        remarks.append(f'推荐下单量{recommend_order_qty}pcs已归零')
+        recommend_order_qty = 0
 
     if hidden['首个未覆盖空窗日'] is not None:
         remarks.append('部分剩余合同到美晚于补货需求日，详见剩余合同发货计划')
@@ -626,8 +653,6 @@ def compute_contract_recommendation(row, contracts, lead_days_by_spu, theoretica
         status = '缺少合同'
     elif hidden['首个未覆盖空窗日'] is not None:
         status = '存在库存空窗'
-    elif recommend_order_qty > 0 and latest_order_date and latest_order_date < today:
-        status = '已逾期'
     elif recommend_order_qty > 0:
         status = '建议下单'
     else:
@@ -697,6 +722,26 @@ def build_daily_sales_fn(row, today):
         m_idx = min(max(m_diff, 0), len(forecasts) - 1)
         days_in_m = calendar.monthrange(d_obj.year, d_obj.month)[1]
         return max(forecasts[m_idx] / days_in_m, 0.01)
+
+    return daily_sales
+
+
+def build_contract_daily_sales_fn(row, today):
+    """合同备货只使用实际填写的 M1-M6 预测，空白/0 及 M6 后均为 0 日销。"""
+    forecasts = []
+    for col in FORECAST_COLS:
+        try:
+            value = float(row.get(col, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        forecasts.append(value if math.isfinite(value) and value > 0 else 0.0)
+
+    def daily_sales(d_obj):
+        m_diff = (d_obj.year - today.year) * 12 + d_obj.month - today.month
+        if m_diff < 0 or m_diff >= len(forecasts):
+            return 0.0
+        days_in_m = calendar.monthrange(d_obj.year, d_obj.month)[1]
+        return forecasts[m_diff] / days_in_m
 
     return daily_sales
 
@@ -2566,7 +2611,7 @@ if btn_recommend:
                 )
                 note = ''
                 if status == 'small':
-                    note = f"需求{q_raw}pcs已归零"
+                    note = f"本轮发货需求{int(round(q_raw))}pcs已归零"
                     small_count += 1
                 elif status == 'redundant':
                     note = "库存已冗余"

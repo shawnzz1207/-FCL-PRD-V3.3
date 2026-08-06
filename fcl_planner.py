@@ -7,6 +7,7 @@ import copy
 import io
 import math
 import streamlit as st
+from openpyxl.utils import get_column_letter
 
 # 设置宽布局（必须是第一个 streamlit 命令）
 st.set_page_config(page_title="北美全渠道智能分仓系统 V3.6.5", layout="wide")
@@ -15,9 +16,10 @@ st.set_page_config(page_title="北美全渠道智能分仓系统 V3.6.5", layout
 # ============================================================
 REGIONS = ['美西', '美东', 'GA', 'TX', 'CG']
 TRANSFER_REGIONS = ['美西', '美东', 'GA', 'TX']  # CG 不参与调拨
+FORECAST_MONTH_COUNT = 12
 FORECAST_COLS = [
-    'M1预测(当月)', 'M2预测(次月)', 'M3预测(第3月)',
-    'M4预测(第4月)', 'M5预测(第5月)', 'M6预测(第6月)'
+    'M1预测(当月)', 'M2预测(次月)',
+    *[f'M{i}预测(第{i}月)' for i in range(3, FORECAST_MONTH_COUNT + 1)]
 ]
 CONTRACT_SOURCE_COLS = {
     'SKU': '产品编号',
@@ -123,6 +125,15 @@ def aggregate_data(df):
         # 月度预测求和
         for m in FORECAST_COLS:
             row[m] = group_df[m].sum() if m in group_df.columns else 0.0
+
+        # 仅当同一汇总组内每行都填写了完整日销时，保留精确日销。
+        # 否则保留月销口径，避免把空白日销误当作 0 日销。
+        daily_cols = [col for col in df_copy.columns if is_daily_forecast_column(col)]
+        for col in daily_cols:
+            if group_df[col].notna().all() and not (group_df[col].astype(str).str.strip() == '').any():
+                row[col] = pd.to_numeric(group_df[col], errors='coerce').sum()
+            else:
+                row[col] = None
         grouped_records.append(row)
     return pd.DataFrame(grouped_records)
 
@@ -177,6 +188,117 @@ def parse_date_value(val):
     if pd.isna(parsed):
         return None
     return parsed.date()
+
+
+def forecast_month_start(today, month_index):
+    """返回相对预测月 M1-M12 的月初日期。"""
+    total_months = today.year * 12 + today.month - 1 + int(month_index) - 1
+    year, month_zero_based = divmod(total_months, 12)
+    return datetime.date(year, month_zero_based + 1, 1)
+
+
+def daily_forecast_col_name(month_index, day):
+    """日销模板字段名，例如 M1日销01。"""
+    return f'M{int(month_index)}日销{int(day):02d}'
+
+
+def daily_forecast_cols_for_month(today, month_index):
+    month_start = forecast_month_start(today, month_index)
+    days_in_month = calendar.monthrange(month_start.year, month_start.month)[1]
+    return [daily_forecast_col_name(month_index, day)
+            for day in range(1, days_in_month + 1)]
+
+
+def is_daily_forecast_column(col):
+    col_text = str(col)
+    return col_text.startswith('M') and '日销' in col_text
+
+
+def is_blank_value(value):
+    """区分空白和数值 0，避免把已填写的 0 日销误判为空。"""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def to_finite_number(value):
+    """将单元格值转为有限数值；空白、文本或无穷值返回 None。"""
+    if is_blank_value(value):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def get_daily_forecast_values(row, today, month_index):
+    """仅当一个月每日均完整且为非负数时，返回该月的精确日销列表。"""
+    cols = daily_forecast_cols_for_month(today, month_index)
+    if any(col not in row for col in cols):
+        return None
+
+    values = []
+    for col in cols:
+        value = to_finite_number(row.get(col))
+        if value is None or value < 0:
+            return None
+        values.append(value)
+    return values
+
+
+def validate_daily_forecast_input(df, today):
+    """校验日销录入：一旦某月填写日销，必须全月完整且和月销一致。"""
+    errors = []
+    for row_idx, row in df.iterrows():
+        for month_index, month_col in enumerate(FORECAST_COLS, start=1):
+            expected_cols = daily_forecast_cols_for_month(today, month_index)
+            present_cols = [col for col in expected_cols if col in df.columns]
+            supplied_cols = [col for col in present_cols if not is_blank_value(row.get(col))]
+            if not supplied_cols:
+                continue
+
+            reasons = []
+            missing_headers = [col for col in expected_cols if col not in df.columns]
+            if missing_headers:
+                reasons.append(f'缺少 {len(missing_headers)} 个日销列')
+            if len(supplied_cols) != len(expected_cols):
+                reasons.append('日销必须填写当月全部自然日')
+
+            daily_values = []
+            invalid_daily = False
+            for col in expected_cols:
+                value = to_finite_number(row.get(col)) if col in df.columns else None
+                if value is None or value < 0:
+                    invalid_daily = True
+                else:
+                    daily_values.append(value)
+            if invalid_daily:
+                reasons.append('日销需为非负数字')
+
+            monthly_sales = to_finite_number(row.get(month_col))
+            if monthly_sales is None or monthly_sales < 0:
+                reasons.append('月销必须填写非负数字')
+            elif not invalid_daily and len(daily_values) == len(expected_cols):
+                daily_total = sum(daily_values)
+                if abs(daily_total - monthly_sales) > 0.01:
+                    reasons.append(
+                        f'日销汇总 {daily_total:.2f} 与月销 {monthly_sales:.2f} 不一致'
+                    )
+
+            if reasons:
+                errors.append({
+                    '行号': row_idx + 2,
+                    'SKU': clean_text(row.get('SKU')) or '-',
+                    '月份': f'M{month_index}',
+                    '异常说明': '；'.join(reasons),
+                })
+    return errors
 
 
 def normalize_contract_qty(val):
@@ -709,39 +831,74 @@ def compute_deadlines(transit_dict, earliest_etd, target_eta):
     return deadlines
 
 
-def build_daily_sales_fn(row, today):
-    """根据行的 M1-M6 预测，返回一个 daily_sales(date) 函数"""
-    forecasts = tuple(float(row.get(col, 0) or 0) for col in FORECAST_COLS)
+def get_monthly_forecast_total(row, today, month_index):
+    """返回该预测月的月销总量及可选的精确日销数据。"""
+    daily_values = get_daily_forecast_values(row, today, month_index)
+    if daily_values is not None:
+        return sum(daily_values), daily_values
 
-    # 全段无销售预测时按真实零日销处理，避免被误判为缺货方。
-    if sum(forecasts) <= 0:
+    value = to_finite_number(row.get(FORECAST_COLS[month_index - 1]))
+    return (value if value is not None and value > 0 else 0.0), None
+
+
+def build_daily_sales_fn(row, today, sales_cutoff=None):
+    """主发货/调拨日销：M1-M12 后沿用最近有效预测，最长只到销售截止日。"""
+    months = []
+    last_effective_total = 0.0
+    for month_index in range(1, FORECAST_MONTH_COUNT + 1):
+        total, daily_values = get_monthly_forecast_total(row, today, month_index)
+        if total > 0:
+            last_effective_total = total
+        months.append({
+            'total': total,
+            'daily_values': daily_values,
+            'last_effective_total': last_effective_total,
+        })
+
+    if last_effective_total <= 0:
         return lambda d_obj: 0.0
 
     def daily_sales(d_obj):
+        if sales_cutoff is not None and d_obj > sales_cutoff:
+            return 0.0
+
         m_diff = (d_obj.year - today.year) * 12 + d_obj.month - today.month
-        m_idx = min(max(m_diff, 0), len(forecasts) - 1)
-        days_in_m = calendar.monthrange(d_obj.year, d_obj.month)[1]
-        return max(forecasts[m_idx] / days_in_m, 0.01)
+        if m_diff < 0:
+            m_diff = 0
+
+        if m_diff < len(months):
+            month_data = months[m_diff]
+            if month_data['daily_values'] is not None and month_data['total'] > 0:
+                return month_data['daily_values'][d_obj.day - 1]
+            total = month_data['total'] or month_data['last_effective_total']
+        else:
+            total = last_effective_total
+
+        if total <= 0:
+            return 0.0
+        days_in_month = calendar.monthrange(d_obj.year, d_obj.month)[1]
+        return max(total / days_in_month, 0.01)
 
     return daily_sales
 
 
 def build_contract_daily_sales_fn(row, today):
-    """合同备货只使用实际填写的 M1-M6 预测，空白/0 及 M6 后均为 0 日销。"""
-    forecasts = []
-    for col in FORECAST_COLS:
-        try:
-            value = float(row.get(col, 0) or 0)
-        except (TypeError, ValueError):
-            value = 0.0
-        forecasts.append(value if math.isfinite(value) and value > 0 else 0.0)
+    """合同备货仅使用 M1-M12 实填预测；空白/0 及 M12 后均按 0 处理。"""
+    months = [get_monthly_forecast_total(row, today, month_index)
+              for month_index in range(1, FORECAST_MONTH_COUNT + 1)]
 
     def daily_sales(d_obj):
         m_diff = (d_obj.year - today.year) * 12 + d_obj.month - today.month
-        if m_diff < 0 or m_diff >= len(forecasts):
+        if m_diff < 0 or m_diff >= len(months):
             return 0.0
-        days_in_m = calendar.monthrange(d_obj.year, d_obj.month)[1]
-        return forecasts[m_diff] / days_in_m
+
+        monthly_total, daily_values = months[m_diff]
+        if daily_values is not None:
+            return daily_values[d_obj.day - 1]
+        if monthly_total <= 0:
+            return 0.0
+        days_in_month = calendar.monthrange(d_obj.year, d_obj.month)[1]
+        return monthly_total / days_in_month
 
     return daily_sales
 
@@ -770,7 +927,8 @@ def waterpool_allocation(row, transit_dict, earliest_etd, target_eta,
 
 
 def waterpool_allocation_v2(row, transit_dict, earliest_etd, target_eta,
-                            today, south_linkage=False, q_ship_override=None):
+                            today, south_linkage=False, q_ship_override=None,
+                            sales_cutoff=None):
     """
     V3.5 原版水池分配算法（含虚拟负债），显式传入 today 参数。
 
@@ -778,7 +936,7 @@ def waterpool_allocation_v2(row, transit_dict, earliest_etd, target_eta,
         alloc_int: {区: 整数发货量} 满足 sum = q_ship
     """
     arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
-    daily_sales = build_daily_sales_fn(row, today)
+    daily_sales = build_daily_sales_fn(row, today, sales_cutoff=sales_cutoff)
 
     q_ship = float(row.get('本次总发货量', 0) or 0) if q_ship_override is None else q_ship_override
 
@@ -920,7 +1078,7 @@ def physical_simulation(row, transit_dict, earliest_etd, target_eta,
         real_final_arrival: 最后一批"有货量"到港日
         cz_before_cutoff: 销售截止日前累计跨区订单数
         cz_to_end: 推演到 end_date（若给定）的累计跨区
-        oos_date: 物理耗尽日
+        oos_date: 物理耗尽日；若销售截止日后仍有库存，则为 None
         sim_stock_at_end: end_date 那天的 sim_stock（若 end_date 给定）
         sim_stock_at_real_final: real_final_arrival 那天的 sim_stock
 
@@ -932,7 +1090,7 @@ def physical_simulation(row, transit_dict, earliest_etd, target_eta,
     - real_final_arrival = max(在途批次有货的日期 ∪ alloc>0 的 arrival 日)
     """
     arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
-    daily_sales = build_daily_sales_fn(row, today)
+    daily_sales = build_daily_sales_fn(row, today, sales_cutoff=sales_cutoff)
 
     raw_ratios = {r: float(row.get(ratio_col_name(r), 0) or 0) for r in REGIONS}
     tr = sum(raw_ratios.values())
@@ -955,9 +1113,9 @@ def physical_simulation(row, transit_dict, earliest_etd, target_eta,
     else:
         real_final_arrival = today  # 无未来进货事件
 
-    # 推演终点：取 max(end_date 或 sales_cutoff, real_final_arrival) 保证能截到 final_ratio
+    # 推演终点：保证能截到销售截止日、指定沙盘日期和最后一批到货。
     hard_end = end_date if end_date is not None else sales_cutoff
-    sim_until = max(hard_end, real_final_arrival, sales_cutoff) + datetime.timedelta(days=30)
+    sim_until = max(hard_end, real_final_arrival, sales_cutoff)
 
     sim_stock = in_wh.copy()
     cz_before_cutoff = 0.0
@@ -1027,12 +1185,10 @@ def physical_simulation(row, transit_dict, earliest_etd, target_eta,
             oos_date = sim_date
 
         # ---- 终止条件 ----
-        if sim_date >= sim_until and oos_date is not None:
+        if sim_date >= sim_until and (oos_date is not None or sim_date >= sales_cutoff):
             break
 
     # 边界处理
-    if oos_date is None:
-        oos_date = sim_date
     if sim_stock_at_real_final is None:
         sim_stock_at_real_final = {r: max(0, sim_stock[r]) for r in REGIONS}
     if end_date is not None and sim_stock_at_end is None:
@@ -1075,7 +1231,7 @@ def compute_row_metrics(row, transit_dict, earliest_etd, target_eta,
     """
     alloc_int = waterpool_allocation_v2(
         row, transit_dict, earliest_etd, target_eta,
-        today, south_linkage, q_ship_override
+        today, south_linkage, q_ship_override, sales_cutoff=sales_cutoff
     )
     deadlines = compute_deadlines(transit_dict, earliest_etd, target_eta)
     arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
@@ -1145,7 +1301,8 @@ def compute_row_status(row, transit_dict, earliest_etd, target_eta,
     """
     # 先算水池分配
     alloc = waterpool_allocation_v2(
-        row, transit_dict, earliest_etd, target_eta, today, south_linkage
+        row, transit_dict, earliest_etd, target_eta, today, south_linkage,
+        sales_cutoff=sales_cutoff
     )
     # 单次推演同时输出 SD/RQ/CZ
     row_dict = row if isinstance(row, dict) else row.to_dict()
@@ -1170,7 +1327,7 @@ def _compute_sd_rq_cz_in_one_pass(row, alloc, transit_dict, earliest_etd, target
     （替代分开调用 physical_simulation 和 compute_sd，性能优化）
     """
     arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
-    daily_sales = build_daily_sales_fn(row, today)
+    daily_sales = build_daily_sales_fn(row, today, sales_cutoff=sales_cutoff)
 
     raw_ratios = {r: float(row.get(ratio_col_name(r), 0) or 0) for r in REGIONS}
     tr = sum(raw_ratios.values())
@@ -1243,7 +1400,7 @@ def compute_sd(row, alloc, transit_dict, earliest_etd, target_eta,
     定义：从今天到销售截止日期间，全网物理库存 > 0 的天数
     """
     arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
-    daily_sales = build_daily_sales_fn(row, today)
+    daily_sales = build_daily_sales_fn(row, today, sales_cutoff=sales_cutoff)
 
     raw_ratios = {r: float(row.get(ratio_col_name(r), 0) or 0) for r in REGIONS}
     tr = sum(raw_ratios.values())
@@ -1326,7 +1483,7 @@ def recommend_q_ship(row_dict, transit_dict, earliest_etd, target_eta,
         return 0, 0, 'redundant'
 
     # ---- 步骤2: q=Q_max 解析反推 ----
-    daily_sales = build_daily_sales_fn(row_dict, today)
+    daily_sales = build_daily_sales_fn(row_dict, today, sales_cutoff=sales_cutoff)
     sales_window = (sales_cutoff - today).days
     q_max = sum(daily_sales(today + datetime.timedelta(days=i))
                 for i in range(1, sales_window + 1))
@@ -1461,6 +1618,7 @@ def _row_status_cache_key(row_dict):
         + [f'{r}_在仓' for r in REGIONS]
         + [f'{r}_多批次在途' for r in REGIONS]
         + FORECAST_COLS
+        + [col for col in row_dict if is_daily_forecast_column(col)]
     )
     values = []
     for col in status_cols:
@@ -2259,9 +2417,15 @@ def stage4_dead_redundancy_report(df, transit_dict, earliest_etd, target_eta,
         st = compute_row_status(row_dict, transit_dict, earliest_etd, target_eta,
                                 today, sales_cutoff, south_linkage)
         if st['RQ'] > 0.5:
-            forecasts = tuple(float(row_dict.get(col, 0) or 0)
-                              for col in FORECAST_COLS)
-            avg_daily = max(sum(forecasts) / (30 * len(FORECAST_COLS)), 0.1)
+            sales_window = max(1, (sales_cutoff - today).days)
+            daily_sales = build_daily_sales_fn(
+                row_dict, today, sales_cutoff=sales_cutoff
+            )
+            demand_in_window = sum(
+                daily_sales(today + datetime.timedelta(days=day))
+                for day in range(1, sales_window + 1)
+            )
+            avg_daily = max(demand_in_window / sales_window, 0.1)
             dead_days = int(round(st['RQ'] / avg_daily))
             dead_records.append({
                 'SKU': row_dict.get('SKU', '-'),
@@ -2425,13 +2589,25 @@ def generate_excel_template():
         '美西_多批次在途': [f'{(today + datetime.timedelta(days=8)).strftime("%Y-%m-%d")}:2000', ''],
         '美东_多批次在途': ['', f'{(today + datetime.timedelta(days=8)).strftime("%Y-%m-%d")}:4000'],
         'GA_多批次在途': ['', ''], 'TX_多批次在途': ['', ''], 'CG_多批次在途': ['', ''],
-        'M1预测(当月)': [1000, 1000], 'M2预测(次月)': [1000, 1000], 'M3预测(第3月)': [1000, 1000],
-        'M4预测(第4月)': [1000, 1000], 'M5预测(第5月)': [1000, 1000], 'M6预测(第6月)': [1000, 1000]
     }
+    for month_index, month_col in enumerate(FORECAST_COLS, start=1):
+        template[month_col] = [1000, 1000] if month_index <= 6 else ['', '']
+        for daily_col in daily_forecast_cols_for_month(today, month_index):
+            template[daily_col] = ['', '']
+
     df_tpl = pd.DataFrame(template)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_tpl.to_excel(writer, index=False, sheet_name='发货需求表')
+        worksheet = writer.sheets['发货需求表']
+        worksheet.sheet_properties.outlinePr.summaryRight = False
+        for month_index in range(1, FORECAST_MONTH_COUNT + 1):
+            daily_cols = daily_forecast_cols_for_month(today, month_index)
+            first_col = get_column_letter(df_tpl.columns.get_loc(daily_cols[0]) + 1)
+            last_col = get_column_letter(df_tpl.columns.get_loc(daily_cols[-1]) + 1)
+            worksheet.column_dimensions.group(
+                first_col, last_col, outline_level=1, hidden=True
+            )
     return output.getvalue()
 
 
@@ -2440,7 +2616,7 @@ with col1:
     st.download_button(
         "⬇️ 下载标准模板",
         data=generate_excel_template(),
-        file_name='北美智能分仓模板_V3.6.5.xlsx',
+        file_name='北美智能分仓模板_V3.7.xlsx',
         type="primary"
     )
 with col2:
@@ -2469,7 +2645,7 @@ if uploaded_file is not None:
                 st.info(f"已自动探测表头位置（原文件第 {header_row_idx + 2} 行为表头）")
                 break
 
-    # 兼容旧版五个月模板：缺少的预测月份自动按 0 补齐。
+    # 兼容旧版模板：缺少的预测月份自动按 0 补齐。
     for col in FORECAST_COLS:
         if col not in df_input.columns:
             df_input[col] = 0.0
@@ -2480,6 +2656,12 @@ if uploaded_file is not None:
     if missing:
         st.error(f"上传的文件缺少必需列：{missing}")
         st.write("当前列名：", list(df_input.columns))
+        st.stop()
+
+    daily_forecast_errors = validate_daily_forecast_input(df_input, today)
+    if daily_forecast_errors:
+        st.error("日销预测校验失败：填写日销的月份必须填满全部自然日，且日销汇总必须等于月销。")
+        st.dataframe(pd.DataFrame(daily_forecast_errors), use_container_width=True)
         st.stop()
 else:
     # 默认示例：张三-李四经典互补场景
@@ -2496,6 +2678,11 @@ else:
         'M1预测(当月)': [1000, 1000], 'M2预测(次月)': [1000, 1000], 'M3预测(第3月)': [1000, 1000],
         'M4预测(第4月)': [1000, 1000], 'M5预测(第5月)': [1000, 1000], 'M6预测(第6月)': [1000, 1000]
     })
+
+# 默认示例及历史推荐结果同样补齐 M7-M12，旧模板可继续直接运行。
+for col in FORECAST_COLS:
+    if col not in df_input.columns:
+        df_input[col] = 0.0
 
 # ============================================================
 # V3.7a: 推荐发货量结果优先作为编辑器数据源
@@ -2524,8 +2711,14 @@ if rec_msgs:
     if parts:
         st.warning("⚠️ " + "; ".join(parts) + "。明细见表格「备注」列。")
 
-edited_df = st.data_editor(df_input, num_rows="dynamic", use_container_width=True,
-                           key=f"main_editor_v{st.session_state.get('rec_version', 0)}")
+daily_editor_columns = [col for col in df_input.columns if is_daily_forecast_column(col)]
+edited_df = st.data_editor(
+    df_input,
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config={col: None for col in daily_editor_columns},
+    key=f"main_editor_v{st.session_state.get('rec_version', 0)}"
+)
 
 contract_file = st.file_uploader(
     "⬆️ 上传合同明细 + SPU交期 Excel（Sheet1 合同明细，Sheet2 交期表）",
@@ -2546,7 +2739,11 @@ with col_rec2:
     st.caption("生成后会回写「本次总发货量」为合同约束后的本轮实际发货量；可人工检查、修改后再点「开始逆向推演运算」。")
 
 if btn_recommend:
-    if d_diff_invalid:
+    button_daily_errors = validate_daily_forecast_input(edited_df, today)
+    if button_daily_errors:
+        st.error("日销预测校验失败，请修正后再生成推荐备发货量。")
+        st.dataframe(pd.DataFrame(button_daily_errors), use_container_width=True)
+    elif d_diff_invalid:
         st.error("D差小于最短海运时效, 无法计算推荐备发货量!")
     elif contract_file is None:
         st.error("请先上传合同明细 + SPU交期 Excel。")
@@ -2768,7 +2965,10 @@ def compute_main_board(df, transit_dict, earliest_etd, target_eta, today, sales_
             '最终全网占比估值': final_str,
             '最终全网到货日': m['real_final_arrival'].strftime('%Y-%m-%d'),
             '预估跨区订单数量': int(round(m['cz_before_cutoff'])),
-            '预估全网耗尽日': m['oos_date'].strftime('%Y-%m-%d'),
+            '预估全网耗尽日': (
+                m['oos_date'].strftime('%Y-%m-%d')
+                if m['oos_date'] is not None else '销售截止日后'
+            ),
             '建议减量至': suggest_qty_str,
             '_is_redundant': is_redundant
         })
@@ -2819,7 +3019,11 @@ for k in SESSION_KEYS:
 # 执行运算
 # ============================================================
 if btn_run:
-    if d_diff_invalid:
+    button_daily_errors = validate_daily_forecast_input(edited_df, today)
+    if button_daily_errors:
+        st.error("日销预测校验失败，请修正后再开始逆向推演。")
+        st.dataframe(pd.DataFrame(button_daily_errors), use_container_width=True)
+    elif d_diff_invalid:
         st.error("D差小于最短海运时效，无法计算！")
     else:
         # 数据规范化

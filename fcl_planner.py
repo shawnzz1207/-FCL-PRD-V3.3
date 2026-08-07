@@ -842,20 +842,17 @@ def get_monthly_forecast_total(row, today, month_index):
 
 
 def build_daily_sales_fn(row, today, sales_cutoff=None):
-    """主发货/调拨日销：M1-M12 后沿用最近有效预测，最长只到销售截止日。"""
+    """主发货/调拨日销：0/空白月不续推，仅以 0.01/天维持日期推演保底。"""
     months = []
-    last_effective_total = 0.0
     for month_index in range(1, FORECAST_MONTH_COUNT + 1):
         total, daily_values = get_monthly_forecast_total(row, today, month_index)
-        if total > 0:
-            last_effective_total = total
         months.append({
             'total': total,
             'daily_values': daily_values,
-            'last_effective_total': last_effective_total,
         })
 
-    if last_effective_total <= 0:
+    # 全段均未填写预测时按真实零日销处理，避免零需求 SKU 进入调拨需求方。
+    if not any(month['total'] > 0 for month in months):
         return lambda d_obj: 0.0
 
     def daily_sales(d_obj):
@@ -868,14 +865,11 @@ def build_daily_sales_fn(row, today, sales_cutoff=None):
 
         if m_diff < len(months):
             month_data = months[m_diff]
-            if month_data['daily_values'] is not None and month_data['total'] > 0:
+            if month_data['daily_values'] is not None:
                 return month_data['daily_values'][d_obj.day - 1]
-            total = month_data['total'] or month_data['last_effective_total']
+            total = month_data['total']
         else:
-            total = last_effective_total
-
-        if total <= 0:
-            return 0.0
+            total = 0.0
         days_in_month = calendar.monthrange(d_obj.year, d_obj.month)[1]
         return max(total / days_in_month, 0.01)
 

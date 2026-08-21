@@ -2666,7 +2666,7 @@ with st.expander("📖 核心指标说明", expanded=False):
     - 预估全网耗尽日：物理全部卖空的日期
 
     **调拨流程**（4 阶段）：
-    1. 阶段1 冗余调拨（救命）：把冗余方的货给缺货方
+    1. 阶段1 冗余调拨（挽回）：把冗余方的货给缺货方
     2. 阶段2 独立减量：剩余冗余直接减本次发货量
     3. 阶段3 分区调拨（降本）：单向 + 双向对调，降低跨区运费
     4. 阶段4 死冗余报告：仍卖不掉的货
@@ -3242,9 +3242,9 @@ if btn_run:
                 st.session_state['alloc_result_s0'] = board_s0
                 st.session_state['current_stage'] = 'S0'
 
-            # 若启用调拨：跑阶段1+2，把结果暂存（等用户点击"确认救命方案"才进入 S1）
+            # 若启用调拨：跑阶段1+2，把结果暂存（等用户点击"确认挽回销售方案"才进入 S1）
             if transfer_on:
-                with st.spinner("正在计算阶段1+2（救命+减量）..."):
+                with st.spinner("正在计算阶段1+2（挽回+减量）..."):
                     s1_records, s2_records, df_after_s12 = run_stage_1_and_2(
                         working_df, transit_times, earliest_etd, target_eta,
                         today, sales_cutoff, south_linkage
@@ -3274,7 +3274,7 @@ if st.session_state['alloc_result_s0'] is not None:
     else:
         stage_label_map = {
             'S0': "📊 当前显示：**原始基线方案**",
-            'S1': "📊 当前显示：**救命+减量后的方案**（阶段1+2 完成）",
+            'S1': "📊 当前显示：**挽回+减量后的方案**（阶段1+2 完成）",
             'S2': "📊 当前显示：**完整调拨方案**（阶段3 完成）"
         }
     st.info(stage_label_map[stage])
@@ -3344,7 +3344,7 @@ if st.session_state['alloc_result_s0'] is not None:
 if (st.session_state['current_stage'] == 'S0'
         and st.session_state.get('s12_records') is not None):
     st.markdown("---")
-    st.header("🔴 4. 阶段1+2：救命与减量方案")
+    st.header("🔴 4. 阶段1+2：挽回与减量方案")
 
     s12 = st.session_state['s12_records']
     s1_transfer = s12['s1_transfer']
@@ -3399,11 +3399,11 @@ if (st.session_state['current_stage'] == 'S0'
                       delta=f"{int(after_total_short - baseline_total_short)}",
                       delta_color="inverse")
 
-    # 控制按钮（必须在 if s1_transfer or s2_reduce 外面,否则没救命方案时按钮消失）
+    # 控制按钮（必须在 if s1_transfer or s2_reduce 外面,否则没挽回方案时按钮消失）
     st.markdown("---")
     col_b1, col_b2 = st.columns([1, 1])
     with col_b1:
-        if st.button("✅ 确认救命方案,主看板刷新并继续优化", type="primary"):
+        if st.button("✅ 确认挽回方案,主看板刷新并继续优化", type="primary"):
             with st.spinner("正在刷新主看板 + 计算阶段3+4..."):
                 # 主看板基于 stage12_df 刷新
                 st.session_state['alloc_result_s1'] = compute_main_board(
@@ -3430,7 +3430,7 @@ if (st.session_state['current_stage'] == 'S0'
             st.rerun()
     with col_b2:
         if st.button("⚡ 仅运算分区调拨", type="secondary",
-                     help="跳过救命方案,直接基于 S0 原始数据运算分区调拨"):
+                     help="跳过挽回方案,直接基于 S0 原始数据运算分区调拨"):
             with st.spinner("正在基于 S0 原始数据运算分区调拨..."):
                 # 主看板复用 S0 数据(剔除备注: 进入后续运算后备注消失)
                 _s1_board = st.session_state['alloc_result_s0'].copy()
@@ -3465,7 +3465,7 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
 
     # 状态提示:区分独立路径和完整路径
     if st.session_state.get('independent_mode'):
-        st.warning("🔵 当前为【仅运算分区调拨】独立模式:基于 S0 原始数据,跳过了阶段1+2 救命方案。")
+        st.warning("🔵 当前为【仅运算分区调拨】独立模式:基于 S0 原始数据,跳过了阶段1+2 挽回方案。")
 
     s34 = st.session_state.get('s34_records', {})
     s3_transfer = s34.get('s3_transfer', [])
@@ -3582,7 +3582,7 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
                 st.rerun()
     else:  # S2
         if st.session_state.get('independent_mode'):
-            # 独立模式:只有"全部撤销"按钮(因为没有救命方案可回)
+            # 独立模式:只有"全部撤销"按钮(因为没有挽回方案可回)
             if st.button("⏪ 全部撤销,回到原始基线"):
                 st.session_state['current_stage'] = 'S0'
                 st.rerun()
@@ -3590,7 +3590,7 @@ if st.session_state['current_stage'] in ('S1', 'S2'):
             # 完整流程:两个撤销按钮都显示
             col_a1, col_a2 = st.columns([1, 1])
             with col_a1:
-                if st.button("↩️ 撤销分区调拨,回到救命方案"):
+                if st.button("↩️ 撤销分区调拨,回到挽回方案"):
                     st.session_state['current_stage'] = 'S1'
                     st.rerun()
             with col_a2:

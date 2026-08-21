@@ -922,17 +922,21 @@ def waterpool_allocation(row, transit_dict, earliest_etd, target_eta,
 
 def waterpool_allocation_v2(row, transit_dict, earliest_etd, target_eta,
                             today, south_linkage=False, q_ship_override=None,
-                            sales_cutoff=None):
+                            sales_cutoff=None, daily_sales_fn=None):
     """
     V3.5 原版水池分配算法（含虚拟负债），显式传入 today 参数。
 
     Returns:
         alloc_int: {区: 整数发货量} 满足 sum = q_ship
     """
-    arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
-    daily_sales = build_daily_sales_fn(row, today, sales_cutoff=sales_cutoff)
-
     q_ship = float(row.get('本次总发货量', 0) or 0) if q_ship_override is None else q_ship_override
+    # 无本次发货时，各区分配必然全为 0；跳过与结果无关的虚拟水池沙盘。
+    if q_ship == 0:
+        return {r: 0.0 for r in REGIONS}
+
+    arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
+    daily_sales = (daily_sales_fn if daily_sales_fn is not None
+                   else build_daily_sales_fn(row, today, sales_cutoff=sales_cutoff))
 
     raw_ratios = {r: float(row.get(ratio_col_name(r), 0) or 0) for r in REGIONS}
     tr = sum(raw_ratios.values())
@@ -1284,7 +1288,8 @@ def compute_sandbox_metrics(row, alloc_int, transit_dict, earliest_etd, target_e
 # 状态度量：SD/RQ/CZ
 # ============================================================
 def compute_row_status(row, transit_dict, earliest_etd, target_eta,
-                       today, sales_cutoff, south_linkage=False):
+                       today, sales_cutoff, south_linkage=False,
+                       daily_sales_fn=None):
     """
     计算一行的核心状态三元组：
     - SD: 实际可售天数（从今天到销售截止日，全网物理库存 > 0 的天数）
@@ -1293,16 +1298,16 @@ def compute_row_status(row, transit_dict, earliest_etd, target_eta,
 
     性能优化：单次推演同时输出 SD/RQ/CZ（替代旧版的 2 次推演）
     """
+    row_dict = row if isinstance(row, dict) else row.to_dict()
     # 先算水池分配
     alloc = waterpool_allocation_v2(
-        row, transit_dict, earliest_etd, target_eta, today, south_linkage,
-        sales_cutoff=sales_cutoff
+        row_dict, transit_dict, earliest_etd, target_eta, today, south_linkage,
+        sales_cutoff=sales_cutoff, daily_sales_fn=daily_sales_fn
     )
     # 单次推演同时输出 SD/RQ/CZ
-    row_dict = row if isinstance(row, dict) else row.to_dict()
     sd, rq, cz, sim_stock_at_cutoff = _compute_sd_rq_cz_in_one_pass(
         row_dict, alloc, transit_dict, earliest_etd, target_eta,
-        today, sales_cutoff
+        today, sales_cutoff, daily_sales_fn=daily_sales_fn
     )
 
     return {
@@ -1315,13 +1320,14 @@ def compute_row_status(row, transit_dict, earliest_etd, target_eta,
 
 
 def _compute_sd_rq_cz_in_one_pass(row, alloc, transit_dict, earliest_etd, target_eta,
-                                  today, sales_cutoff):
+                                  today, sales_cutoff, daily_sales_fn=None):
     """
     单次物理推演同时算出 SD / RQ / CZ
     （替代分开调用 physical_simulation 和 compute_sd，性能优化）
     """
     arrivals = compute_arrivals(transit_dict, earliest_etd, target_eta)
-    daily_sales = build_daily_sales_fn(row, today, sales_cutoff=sales_cutoff)
+    daily_sales = (daily_sales_fn if daily_sales_fn is not None
+                   else build_daily_sales_fn(row, today, sales_cutoff=sales_cutoff))
 
     raw_ratios = {r: float(row.get(ratio_col_name(r), 0) or 0) for r in REGIONS}
     tr = sum(raw_ratios.values())
@@ -1631,12 +1637,13 @@ def _row_status_cache_key(row_dict):
 
 
 def _compute_row_status_cached(row_dict, transit_dict, earliest_etd, target_eta,
-                               today, sales_cutoff, south_linkage, status_cache):
+                               today, sales_cutoff, south_linkage, status_cache,
+                               daily_sales_fn=None):
     key = _row_status_cache_key(row_dict)
     if key not in status_cache:
         status_cache[key] = compute_row_status(
             row_dict, transit_dict, earliest_etd, target_eta,
-            today, sales_cutoff, south_linkage
+            today, sales_cutoff, south_linkage, daily_sales_fn=daily_sales_fn
         )
     return status_cache[key]
 
@@ -1957,13 +1964,55 @@ def filter_partition_candidates(df, sku_indices, status_dict):
     return candidates
 
 
+def backup_transfer_cells(df, transfer_specs):
+    """仅备份一次试算实际会修改的库存/在途单元格。"""
+    backup = {}
+    for out_idx, in_idx, src_type, region in transfer_specs:
+        if src_type == '本次发货量':
+            column = '本次总发货量'
+        elif src_type == '在仓':
+            column = f'{region}_在仓'
+        elif src_type == '在途':
+            column = f'{region}_多批次在途'
+        else:
+            raise ValueError(f'未知调拨来源类型: {src_type}')
+        for idx in (out_idx, in_idx):
+            backup[(idx, column)] = df.at[idx, column]
+    return backup
+
+
+def restore_transfer_cells(df, backup):
+    """恢复调拨试算前的受影响单元格。"""
+    for (idx, column), value in backup.items():
+        df.at[idx, column] = value
+
+
+def compute_stage3_row_status(df, idx, transit_dict, earliest_etd, target_eta,
+                              today, sales_cutoff, south_linkage,
+                              status_cache=None, daily_sales_fns=None):
+    """阶段3专用状态读取：复用同一行不变的日销曲线与相同库存状态结果。"""
+    row_dict = df.loc[idx].to_dict()
+    daily_sales_fn = daily_sales_fns.get(idx) if daily_sales_fns is not None else None
+    if status_cache is None:
+        return compute_row_status(
+            row_dict, transit_dict, earliest_etd, target_eta,
+            today, sales_cutoff, south_linkage, daily_sales_fn=daily_sales_fn
+        )
+    return _compute_row_status_cached(
+        row_dict, transit_dict, earliest_etd, target_eta,
+        today, sales_cutoff, south_linkage, status_cache,
+        daily_sales_fn=daily_sales_fn
+    )
+
+
 # ============================================================
 # 阶段3 分区调拨核心：评估单向 + 双向对调
 # ============================================================
 def evaluate_single_transfer(df, out_idx, in_idx, src_type, src_region, src_date, qty,
                              transit_dict, earliest_etd, target_eta,
                              today, sales_cutoff, south_linkage,
-                             baseline_status):
+                             baseline_status, status_cache=None,
+                             daily_sales_fns=None):
     """评估单向调拨的合法性 + ΔCZ 改善
     锁1: qty <= 物理上限（apply 自带保护）
     锁2: 调出方 SD 不下降
@@ -1973,23 +2022,23 @@ def evaluate_single_transfer(df, out_idx, in_idx, src_type, src_region, src_date
 
     返回 (ΔCZ_total, is_valid)
     """
-    backup = backup_rows(df, [out_idx, in_idx])
+    backup = backup_transfer_cells(df, [(out_idx, in_idx, src_type, src_region)])
 
     actual = apply_transfer(df, out_idx, in_idx, src_type, src_region, src_date, qty)
     if actual < 1:
-        restore_rows(df, backup)
+        restore_transfer_cells(df, backup)
         return 0, False
 
-    out_new = compute_row_status(
-        df.loc[out_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-        today, sales_cutoff, south_linkage
+    out_new = compute_stage3_row_status(
+        df, out_idx, transit_dict, earliest_etd, target_eta,
+        today, sales_cutoff, south_linkage, status_cache, daily_sales_fns
     )
-    in_new = compute_row_status(
-        df.loc[in_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-        today, sales_cutoff, south_linkage
+    in_new = compute_stage3_row_status(
+        df, in_idx, transit_dict, earliest_etd, target_eta,
+        today, sales_cutoff, south_linkage, status_cache, daily_sales_fns
     )
 
-    restore_rows(df, backup)
+    restore_transfer_cells(df, backup)
 
     out_old = baseline_status[out_idx]
     in_old = baseline_status[in_idx]
@@ -2018,32 +2067,36 @@ def evaluate_swap_transfer(df, a_idx, b_idx,
                            type_y, region_y, date_y, qty_y,
                            transit_dict, earliest_etd, target_eta,
                            today, sales_cutoff, south_linkage,
-                           baseline_status):
+                           baseline_status, status_cache=None,
+                           daily_sales_fns=None):
     """评估双向对调原子动作: A 调 X → B + B 调 Y → A，两步必须同时合法
     锁同 evaluate_single_transfer，但对 a_idx 和 b_idx 各自检查
 
     返回 (ΔCZ_total, is_valid)
     """
-    backup = backup_rows(df, [a_idx, b_idx])
+    backup = backup_transfer_cells(df, [
+        (a_idx, b_idx, type_x, region_x),
+        (b_idx, a_idx, type_y, region_y),
+    ])
 
     # 两步同时执行
     actual_x = apply_transfer(df, a_idx, b_idx, type_x, region_x, date_x, qty_x)
     actual_y = apply_transfer(df, b_idx, a_idx, type_y, region_y, date_y, qty_y)
 
     if actual_x < 1 or actual_y < 1:
-        restore_rows(df, backup)
+        restore_transfer_cells(df, backup)
         return 0, False
 
-    a_new = compute_row_status(
-        df.loc[a_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-        today, sales_cutoff, south_linkage
+    a_new = compute_stage3_row_status(
+        df, a_idx, transit_dict, earliest_etd, target_eta,
+        today, sales_cutoff, south_linkage, status_cache, daily_sales_fns
     )
-    b_new = compute_row_status(
-        df.loc[b_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-        today, sales_cutoff, south_linkage
+    b_new = compute_stage3_row_status(
+        df, b_idx, transit_dict, earliest_etd, target_eta,
+        today, sales_cutoff, south_linkage, status_cache, daily_sales_fns
     )
 
-    restore_rows(df, backup)
+    restore_transfer_cells(df, backup)
 
     a_old = baseline_status[a_idx]
     b_old = baseline_status[b_idx]
@@ -2072,7 +2125,8 @@ def evaluate_swap_transfer(df, a_idx, b_idx,
 def binary_search_single_transfer(df, out_idx, in_idx, src_type, src_region, src_date, src_max,
                                   transit_dict, earliest_etd, target_eta,
                                   today, sales_cutoff, south_linkage,
-                                  baseline_status):
+                                  baseline_status, status_cache=None,
+                                  daily_sales_fns=None):
     """
     多档位扫描单向调拨最大有效量（性能优化：6 档 + 3 档精细化）
     """
@@ -2090,7 +2144,8 @@ def binary_search_single_transfer(df, out_idx, in_idx, src_type, src_region, src
         delta, valid = evaluate_single_transfer(
             df, out_idx, in_idx, src_type, src_region, src_date, q,
             transit_dict, earliest_etd, target_eta,
-            today, sales_cutoff, south_linkage, baseline_status
+            today, sales_cutoff, south_linkage, baseline_status,
+            status_cache, daily_sales_fns
         )
         if valid and delta > best_delta:
             best_delta = delta
@@ -2105,7 +2160,8 @@ def binary_search_single_transfer(df, out_idx, in_idx, src_type, src_region, src
             delta, valid = evaluate_single_transfer(
                 df, out_idx, in_idx, src_type, src_region, src_date, q,
                 transit_dict, earliest_etd, target_eta,
-                today, sales_cutoff, south_linkage, baseline_status
+                today, sales_cutoff, south_linkage, baseline_status,
+                status_cache, daily_sales_fns
             )
             if valid and delta > best_delta:
                 best_delta = delta
@@ -2119,7 +2175,8 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
                                 type_y, region_y, date_y, max_y,
                                 transit_dict, earliest_etd, target_eta,
                                 today, sales_cutoff, south_linkage,
-                                baseline_status):
+                                baseline_status, status_cache=None,
+                                daily_sales_fns=None):
     """
     多档位扫描双向对调最大有效量（性能优化：6 档 + 3 档精细化）
 
@@ -2142,7 +2199,8 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
             type_x, region_x, date_x, q,
             type_y, region_y, date_y, q,
             transit_dict, earliest_etd, target_eta,
-            today, sales_cutoff, south_linkage, baseline_status
+            today, sales_cutoff, south_linkage, baseline_status,
+            status_cache, daily_sales_fns
         )
         if valid and delta > best_delta:
             best_delta = delta
@@ -2159,13 +2217,101 @@ def binary_search_swap_transfer(df, a_idx, b_idx,
                 type_x, region_x, date_x, q,
                 type_y, region_y, date_y, q,
                 transit_dict, earliest_etd, target_eta,
-                today, sales_cutoff, south_linkage, baseline_status
+                today, sales_cutoff, south_linkage, baseline_status,
+                status_cache, daily_sales_fns
             )
             if valid and delta > best_delta:
                 best_delta = delta
                 best_qty = q
 
     return best_qty, best_delta
+
+
+def consolidate_partition_transfer_records(records):
+    """合并阶段3中同批次、同双方的重复/反向调拨展示记录。
+
+    阶段3按贪心轮次搜索，后续轮次可能部分抵消早期轮次的同区调拨。
+    内部库存已按原顺序完成推演；这里仅将可互抵的指令按净额输出，
+    不参与后续沙盘计算。
+    """
+    grouped = {}
+    for order, record in enumerate(records):
+        source = record.get('调出方')
+        destination = record.get('调入方')
+        if not source or not destination or source == destination:
+            key = ('raw', order)
+            grouped[key] = {
+                'first_order': order,
+                'records': [record],
+                'forward_qty': 0.0,
+                'reverse_qty': 0.0,
+                'parties': None,
+            }
+            continue
+
+        party_a, party_b = sorted((source, destination))
+        key = (
+            record.get('SKU'),
+            record.get('调拨区域'),
+            record.get('调拨批次'),
+            party_a,
+            party_b,
+        )
+        if key not in grouped:
+            grouped[key] = {
+                'first_order': order,
+                'records': [],
+                'forward_qty': 0.0,
+                'reverse_qty': 0.0,
+                'parties': (party_a, party_b),
+            }
+
+        group = grouped[key]
+        actual_qty = float(record.get('_actual_qty', record.get('调拨数量', 0)) or 0)
+        if source == party_a:
+            group['forward_qty'] += actual_qty
+        else:
+            group['reverse_qty'] += actual_qty
+        group['records'].append(record)
+
+    consolidated = []
+    for group in sorted(grouped.values(), key=lambda item: item['first_order']):
+        source_records = group['records']
+        if len(source_records) == 1 or group['parties'] is None:
+            clean_record = dict(source_records[0])
+            clean_record.pop('_actual_qty', None)
+            consolidated.append(clean_record)
+            continue
+
+        net_qty = group['forward_qty'] - group['reverse_qty']
+        # 净额不足 0.5 件没有可执行意义，直接不再生成往返指令。
+        if abs(net_qty) <= 0.5:
+            continue
+
+        party_a, party_b = group['parties']
+        source, destination = (party_a, party_b) if net_qty > 0 else (party_b, party_a)
+        display_qty = int(round(abs(net_qty)))
+        if display_qty < 1:
+            continue
+
+        first = source_records[0]
+        has_reverse = group['forward_qty'] > 0 and group['reverse_qty'] > 0
+        note = (
+            f"合并{len(source_records)}条同批次反向调拨，净调拨"
+            if has_reverse else f"合并{len(source_records)}条同批次调拨"
+        )
+        consolidated.append({
+            'SKU': first.get('SKU'),
+            '调拨类型': '分区调拨(净额合并)',
+            '调拨区域': first.get('调拨区域'),
+            '调拨批次': first.get('调拨批次'),
+            '调出方': source,
+            '调入方': destination,
+            '调拨数量': display_qty,
+            '备注': note,
+        })
+
+    return consolidated
 
 
 # ============================================================
@@ -2193,13 +2339,22 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
         if len(sku_indices) < 2:
             continue
 
+        # 调拨只改变库存/在途，不改变预测；同一行的日销曲线全程可复用。
+        daily_sales_fns = {
+            idx: build_daily_sales_fn(
+                df.loc[idx].to_dict(), today, sales_cutoff=sales_cutoff
+            )
+            for idx in sku_indices
+        }
+        status_cache = {}
+
         # ===== 早退1: 整 SKU 跨区总和已经很小，没优化空间 =====
         total_cz_check = 0
         skip_status_cache = {}
         for idx in sku_indices:
-            st = compute_row_status(
-                df.loc[idx].to_dict(), transit_dict, earliest_etd, target_eta,
-                today, sales_cutoff, south_linkage
+            st = compute_stage3_row_status(
+                df, idx, transit_dict, earliest_etd, target_eta,
+                today, sales_cutoff, south_linkage, status_cache, daily_sales_fns
             )
             skip_status_cache[idx] = st
             total_cz_check += st['CZ']
@@ -2216,9 +2371,9 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
             else:
                 baseline_status = {}
                 for idx in sku_indices:
-                    baseline_status[idx] = compute_row_status(
-                        df.loc[idx].to_dict(), transit_dict, earliest_etd, target_eta,
-                        today, sales_cutoff, south_linkage
+                    baseline_status[idx] = compute_stage3_row_status(
+                        df, idx, transit_dict, earliest_etd, target_eta,
+                        today, sales_cutoff, south_linkage, status_cache, daily_sales_fns
                     )
 
             # 候选预筛
@@ -2251,7 +2406,8 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                     qty, delta = binary_search_single_transfer(
                         df, out_idx, in_idx, src_type, region, src_date, src_max,
                         transit_dict, earliest_etd, target_eta,
-                        today, sales_cutoff, south_linkage, baseline_status
+                        today, sales_cutoff, south_linkage, baseline_status,
+                        status_cache, daily_sales_fns
                     )
                     if qty < 1:
                         continue
@@ -2307,7 +2463,8 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                                 type_x, region_x, date_x, max_x,
                                 type_y, region_y, date_y, max_y,
                                 transit_dict, earliest_etd, target_eta,
-                                today, sales_cutoff, south_linkage, baseline_status
+                                today, sales_cutoff, south_linkage, baseline_status,
+                                status_cache, daily_sales_fns
                             )
                             if qty >= 1 and delta > best_delta_cz:
                                 best_delta_cz = delta
@@ -2329,7 +2486,8 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                                 type_x2, region_x, date_x2, max_x2,
                                 type_y2, region_y, date_y2, max_y2,
                                 transit_dict, earliest_etd, target_eta,
-                                today, sales_cutoff, south_linkage, baseline_status
+                                today, sales_cutoff, south_linkage, baseline_status,
+                                status_cache, daily_sales_fns
                             )
                             if qty >= 1 and delta > best_delta_cz:
                                 best_delta_cz = delta
@@ -2362,6 +2520,7 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                     '调入方': row_to_key(df.loc[ba['b_idx']]),
                     '调拨数量': int(round(actual)),
                     '备注': f"降跨区 {int(round(ba['delta_cz']))} 单",
+                    '_actual_qty': actual,
                 })
             else:  # swap
                 actual_x = apply_transfer(df, ba['a_idx'], ba['b_idx'],
@@ -2383,6 +2542,7 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                     '调入方': row_to_key(df.loc[ba['b_idx']]),
                     '调拨数量': int(round(actual_x)),
                     '备注': f"对调降运费（合计降 {int(round(ba['delta_cz']))} 单）",
+                    '_actual_qty': actual_x,
                 })
                 transfer_records.append({
                     'SKU': sku,
@@ -2393,9 +2553,10 @@ def stage3_partition_transfer(df, transit_dict, earliest_etd, target_eta,
                     '调入方': row_to_key(df.loc[ba['a_idx']]),
                     '调拨数量': int(round(actual_y)),
                     '备注': f"对调降运费（合计降 {int(round(ba['delta_cz']))} 单）",
+                    '_actual_qty': actual_y,
                 })
 
-    return transfer_records, df
+    return consolidate_partition_transfer_records(transfer_records), df
 
 
 # ============================================================

@@ -1485,9 +1485,14 @@ def recommend_q_ship(row_dict, transit_dict, earliest_etd, target_eta,
     # ---- 步骤2: q=Q_max 解析反推 ----
     daily_sales = build_daily_sales_fn(row_dict, today, sales_cutoff=sales_cutoff)
     sales_window = (sales_cutoff - today).days
-    q_max = sum(daily_sales(today + datetime.timedelta(days=i))
-                for i in range(1, sales_window + 1))
-    q_max = float(int(q_max) + 10)
+    demand_before_cutoff = sum(
+        daily_sales(today + datetime.timedelta(days=i))
+        for i in range(1, sales_window + 1)
+    )
+    # 无实际需求时不进入 +10 的解析试探，避免数值缓冲被误当成发货需求。
+    if demand_before_cutoff <= 0.001:
+        return 0, 0, 'ok'
+    q_max = float(int(demand_before_cutoff) + 10)
 
     if q_max <= 0.5:
         return 0, 0, 'ok'

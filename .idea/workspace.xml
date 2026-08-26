@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="11455900-380c-4334-8ac7-b276898bc6e8" name="更改" comment="月销预测增加至M12&#10;日销增加精准日销选项">
+    <list default="true" id="11455900-380c-4334-8ac7-b276898bc6e8" name="更改" comment="名词修改：“救命”改为“挽回”">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/fcl_planner.py" beforeDir="false" afterPath="$PROJECT_DIR$/fcl_planner.py" afterDir="false" />
     </list>
@@ -78,7 +78,23 @@
       <option name="project" value="LOCAL" />
       <updated>1785987090154</updated>
     </task>
-    <option name="localTasksCounter" value="2" />
+    <task id="LOCAL-00002" summary="优化分区调拨算法，提效约5倍；">
+      <option name="closed" value="true" />
+      <created>1787278362091</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1787278362091</updated>
+    </task>
+    <task id="LOCAL-00003" summary="名词修改：“救命”改为“挽回”">
+      <option name="closed" value="true" />
+      <created>1787278823544</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1787278823544</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -86,6 +102,8 @@
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="月销预测增加至M12&#10;日销增加精准日销选项" />
-    <option name="LAST_COMMIT_MESSAGE" value="月销预测增加至M12&#10;日销增加精准日销选项" />
+    <MESSAGE value="优化分区调拨算法，提效约5倍；" />
+    <MESSAGE value="名词修改：“救命”改为“挽回”" />
+    <option name="LAST_COMMIT_MESSAGE" value="名词修改：“救命”改为“挽回”" />
   </component>
 </project>

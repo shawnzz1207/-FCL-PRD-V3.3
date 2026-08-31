@@ -1591,6 +1591,17 @@ def restore_rows(df, backup):
             df.at[idx, k] = v
 
 
+def build_status_row_dict(df, idx):
+    """仅提取状态沙盘需要的字段，避免在高频试算中复制整行精准日销。"""
+    status_cols = (
+        ['本次总发货量']
+        + [ratio_col_name(r) for r in REGIONS]
+        + [f'{r}_在仓' for r in REGIONS]
+        + [f'{r}_多批次在途' for r in REGIONS]
+    )
+    return {col: df.at[idx, col] for col in status_cols if col in df.columns}
+
+
 # ============================================================
 # 获取一行的可调出批次列表
 # ============================================================
@@ -1653,6 +1664,46 @@ def _compute_row_status_cached(row_dict, transit_dict, earliest_etd, target_eta,
     return status_cache[key]
 
 
+def _stage1_row_status_cache_key(row_dict, row_identity):
+    """阶段1缓存键：预测和占比固定，只跟踪行身份及可变库存状态。"""
+    status_cols = (
+        ['本次总发货量']
+        + [ratio_col_name(r) for r in REGIONS]
+        + [f'{r}_在仓' for r in REGIONS]
+        + [f'{r}_多批次在途' for r in REGIONS]
+    )
+    values = [row_identity]
+    for col in status_cols:
+        value = row_dict.get(col)
+        try:
+            if pd.isna(value):
+                value = None
+        except (TypeError, ValueError):
+            value = repr(value)
+        try:
+            hash(value)
+        except TypeError:
+            value = repr(value)
+        values.append(value)
+    return tuple(values)
+
+
+def _compute_stage1_row_status_cached(df, idx, transit_dict, earliest_etd,
+                                      target_eta, today, sales_cutoff,
+                                      south_linkage, status_cache,
+                                      daily_sales_fns):
+    """阶段1专用状态读取：复用日销曲线，并按精简库存状态缓存。"""
+    row_dict = build_status_row_dict(df, idx)
+    key = _stage1_row_status_cache_key(row_dict, idx)
+    if key not in status_cache:
+        status_cache[key] = compute_row_status(
+            row_dict, transit_dict, earliest_etd, target_eta,
+            today, sales_cutoff, south_linkage,
+            daily_sales_fn=daily_sales_fns[idx]
+        )
+    return status_cache[key]
+
+
 # ============================================================
 # 阶段1：冗余调拨
 # ============================================================
@@ -1669,6 +1720,13 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
         sku_indices = sku_group.index.tolist()
         if len(sku_indices) < 2:
             continue
+        # 调拨不改变预测，同一行的精准日销只需解析一次。
+        daily_sales_fns = {
+            idx: build_daily_sales_fn(
+                df.loc[idx].to_dict(), today, sales_cutoff=sales_cutoff
+            )
+            for idx in sku_indices
+        }
         status_cache = {}
 
         max_iter = 50
@@ -1676,9 +1734,10 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
             # 计算当前所有行的状态
             status = {}
             for idx in sku_indices:
-                st = _compute_row_status_cached(
-                    df.loc[idx].to_dict(), transit_dict, earliest_etd, target_eta,
-                    today, sales_cutoff, south_linkage, status_cache
+                st = _compute_stage1_row_status_cached(
+                    df, idx, transit_dict, earliest_etd, target_eta,
+                    today, sales_cutoff, south_linkage, status_cache,
+                    daily_sales_fns
                 )
                 status[idx] = st
 
@@ -1701,7 +1760,7 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
             best_delta_sd = 0.5  # 最小改善阈值
 
             for g_idx in redundant:
-                g_row = df.loc[g_idx].to_dict()
+                g_row = build_status_row_dict(df, g_idx)
 
                 # 收集所有可调批次（策略 A：本次发货量与在仓/在途平等竞争，由 ΔSD 决定胜负）
                 all_sources = get_shipment_source(g_row) + get_stock_sources(g_row)
@@ -1719,29 +1778,33 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
                             df, g_idx, r_idx, src_type, src_region, src_date, src_max,
                             transit_dict, earliest_etd, target_eta,
                             today, sales_cutoff, south_linkage,
-                            sales_window, status[g_idx], status[r_idx], status_cache
+                            sales_window, status[g_idx], status[r_idx], status_cache,
+                            daily_sales_fns
                         )
 
                         if best_qty < 1:
                             continue
 
                         # 试探性执行，评估 ΔSD
-                        backup = backup_rows(df, [g_idx, r_idx])
+                        backup = backup_transfer_cells(
+                            df, [(g_idx, r_idx, src_type, src_region)]
+                        )
                         actual_q = apply_transfer(df, g_idx, r_idx,
                                                   src_type, src_region, src_date, best_qty)
 
                         if actual_q < 1:
-                            restore_rows(df, backup)
+                            restore_transfer_cells(df, backup)
                             continue
 
-                        r_status_new = _compute_row_status_cached(
-                            df.loc[r_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-                            today, sales_cutoff, south_linkage, status_cache
+                        r_status_new = _compute_stage1_row_status_cached(
+                            df, r_idx, transit_dict, earliest_etd, target_eta,
+                            today, sales_cutoff, south_linkage, status_cache,
+                            daily_sales_fns
                         )
                         delta_sd = r_status_new['SD'] - r_status_old['SD']
 
                         # 回滚
-                        restore_rows(df, backup)
+                        restore_transfer_cells(df, backup)
 
                         if delta_sd > best_delta_sd:
                             best_delta_sd = delta_sd
@@ -1785,7 +1848,8 @@ def stage1_redundancy_transfer(df, transit_dict, earliest_etd, target_eta,
 def binary_search_max_transfer(df, g_idx, r_idx, src_type, src_region, src_date, src_max,
                                transit_dict, earliest_etd, target_eta,
                                today, sales_cutoff, south_linkage,
-                               sales_window, g_status, r_status, status_cache=None):
+                               sales_window, g_status, r_status, status_cache=None,
+                               daily_sales_fns=None):
     """二分搜索：找出"3 重锁"下最大的可调拨量
     锁1: qty <= src_max （物理上限）  → 已在 apply_transfer 保护
     锁2: 调出方调出后 SD 不下降（不变得"更缺货"）
@@ -1801,6 +1865,13 @@ def binary_search_max_transfer(df, g_idx, r_idx, src_type, src_region, src_date,
     r_rq_limit = max(r_baseline_rq, 0.5)
     if status_cache is None:
         status_cache = {}
+    if daily_sales_fns is None:
+        daily_sales_fns = {
+            idx: build_daily_sales_fn(
+                df.loc[idx].to_dict(), today, sales_cutoff=sales_cutoff
+            )
+            for idx in (g_idx, r_idx)
+        }
 
     for _ in range(15):
         if hi - lo < 1:
@@ -1808,25 +1879,29 @@ def binary_search_max_transfer(df, g_idx, r_idx, src_type, src_region, src_date,
         mid = (lo + hi) / 2
 
         # 试探
-        backup = backup_rows(df, [g_idx, r_idx])
+        backup = backup_transfer_cells(
+            df, [(g_idx, r_idx, src_type, src_region)]
+        )
         actual = apply_transfer(df, g_idx, r_idx, src_type, src_region, src_date, mid)
 
         if actual < 1:
-            restore_rows(df, backup)
+            restore_transfer_cells(df, backup)
             hi = mid
             continue
 
         # 评估锁2 & 锁3
-        g_new = _compute_row_status_cached(
-            df.loc[g_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-            today, sales_cutoff, south_linkage, status_cache
+        g_new = _compute_stage1_row_status_cached(
+            df, g_idx, transit_dict, earliest_etd, target_eta,
+            today, sales_cutoff, south_linkage, status_cache,
+            daily_sales_fns
         )
-        r_new = _compute_row_status_cached(
-            df.loc[r_idx].to_dict(), transit_dict, earliest_etd, target_eta,
-            today, sales_cutoff, south_linkage, status_cache
+        r_new = _compute_stage1_row_status_cached(
+            df, r_idx, transit_dict, earliest_etd, target_eta,
+            today, sales_cutoff, south_linkage, status_cache,
+            daily_sales_fns
         )
 
-        restore_rows(df, backup)
+        restore_transfer_cells(df, backup)
 
         # 锁2: 调出方 SD 不下降（不变得更缺货）
         lock2_ok = (g_new['SD'] >= g_baseline_sd - 0.5)
